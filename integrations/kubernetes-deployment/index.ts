@@ -22,6 +22,7 @@ import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
 import { z } from "zod";
 import { Pool } from "postgres";
+import { registerWikiTools, WIKI_INSTRUCTIONS } from "./wiki.ts";
 
 // --- Configuration ---
 
@@ -64,7 +65,6 @@ type ThoughtRecord = {
   content: string;
   metadata: Record<string, unknown>;
   created_at: string;
-  updated_at?: string | null;
 };
 
 const CITATION_BASE_URL =
@@ -138,10 +138,13 @@ Only extract what's explicitly there.`,
 // --- MCP Server Setup ---
 
 function buildServer(): McpServer {
-  const server = new McpServer({
-    name: "open-brain",
-    version: "1.0.0",
-  });
+  const server = new McpServer(
+    {
+      name: "open-brain",
+      version: "1.0.0",
+    },
+    { instructions: WIKI_INSTRUCTIONS },
+  );
 
   // ChatGPT compatibility: restricted connector surfaces, company knowledge, and deep
   // research look for exact read-only `search` and `fetch` tool shapes.
@@ -166,7 +169,7 @@ function buildServer(): McpServer {
         const client = await pool.connect();
         try {
           const result = await client.queryObject<ThoughtMatch>(
-            `SELECT id, content, metadata, created_at,
+            `SELECT id::text AS id, content, metadata, created_at,
                     1 - (embedding <=> $1::vector) AS similarity
              FROM thoughts
              WHERE 1 - (embedding <=> $1::vector) >= $2
@@ -214,7 +217,7 @@ function buildServer(): McpServer {
         const client = await pool.connect();
         try {
           const result = await client.queryObject<ThoughtRecord>(
-            `SELECT id, content, metadata, created_at, updated_at
+            `SELECT id::text AS id, content, metadata, created_at
              FROM thoughts
              WHERE id = $1
              LIMIT 1`,
@@ -237,7 +240,6 @@ function buildServer(): McpServer {
             metadata: {
               ...thought.metadata,
               created_at: thought.created_at,
-              updated_at: thought.updated_at,
             },
           };
 
@@ -563,6 +565,8 @@ function buildServer(): McpServer {
       }
     }
   );
+
+  registerWikiTools(server, { pool, embed: getEmbedding });
 
   return server;
 }
