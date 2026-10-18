@@ -39,6 +39,7 @@ export type WriteInput = {
   body?: string;
   tags?: string[];
   sources?: number[];
+  drop_sources?: number[];
   append?: boolean;
   expected_revision?: number;
   author?: string;
@@ -124,7 +125,7 @@ export function slugError(slug: string): string | null {
 export function slugify(text: string): string {
   return text
     .normalize("NFKD")
-    .replace(/[̀-ͯ]/g, "")
+    .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
@@ -400,13 +401,15 @@ function mergePage(slug: string, current: WikiPage | null, input: WriteInput): P
   if (!body) throw new WikiError("body must not be empty");
   if (body.length > LIMITS.body) throw new WikiError(`body must be at most ${LIMITS.body} characters; split the page`);
 
+  const cited = extractCitations(body);
+  const dropped = new Set((input.drop_sources ?? []).filter((id) => !cited.includes(id)));
   return {
     title,
     summary,
     body,
     tags,
     links: extractLinks(body).filter((s) => s !== slug),
-    sources: uniqueSortedIds([...(current?.sources ?? []), ...(input.sources ?? []), ...extractCitations(body)]),
+    sources: uniqueSortedIds([...(current?.sources ?? []), ...(input.sources ?? []), ...cited]).filter((id) => !dropped.has(id)),
   };
 }
 
@@ -416,6 +419,30 @@ function sameContent(a: PageFields, b: PageFields): boolean {
 
 function embeddingText(page: PageFields): string {
   return `${page.title}\n${page.summary}\n${page.tags.join(", ")}\n\n${page.body}`.slice(0, EMBED_CHARS);
+}
+
+export async function embedMissing(pool: Pool, embed: Embedder): Promise<number> {
+  const missing = await withClient(pool, (c) =>
+    c.queryObject<PageFields & { slug: string; revision: number }>(
+      "SELECT slug, title, summary, body, tags, links, sources, revision FROM wiki_pages WHERE embedding IS NULL ORDER BY slug",
+    )
+  );
+  let fixed = 0;
+  for (const page of missing.rows) {
+    try {
+      const vector = `[${(await embed(embeddingText(page))).join(",")}]`;
+      const result = await withClient(pool, (c) =>
+        c.queryObject(
+          "UPDATE wiki_pages SET embedding = $3::vector WHERE slug = $1 AND revision = $2 AND embedding IS NULL",
+          [page.slug, page.revision, vector],
+        )
+      );
+      fixed += result.rowCount ?? 0;
+    } catch (err) {
+      console.error(`wiki: embedding failed for ${page.slug}: ${(err as Error).message}`);
+    }
+  }
+  return fixed;
 }
 
 const SEARCH_VECTOR = `setweight(to_tsvector('simple', $2::text), 'A')
@@ -936,6 +963,7 @@ export function registerWikiTools(server: McpServer, ctx: WikiContext): void {
         body: z.string().optional().describe("Markdown body without the title heading (required for a new page)"),
         tags: z.array(z.string()).optional().describe("First tag is the category: project, client, person, organization, infrastructure, tool, process, rules or topic"),
         sources: z.array(z.number()).optional().describe("Thought ids this page draws on (ids cited as [#id] are added automatically)"),
+        drop_sources: z.array(z.number()).optional().describe("Thought ids to remove from sources, for example after deleting a wrong citation (ids still cited in the body stay)"),
         append: z.boolean().optional().default(false).describe("Append body to the existing page instead of replacing it"),
         expected_revision: z.number().optional().describe("Current revision you read (0 for a new page); the write fails if the page changed"),
         author: z.string().optional().describe("Who is writing, for example 'claude-code' or 'codex'"),

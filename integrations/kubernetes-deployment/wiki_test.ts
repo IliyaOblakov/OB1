@@ -106,7 +106,7 @@ Deno.test("renderIndex groups pages by category and reports pending thoughts", (
 const DB_HOST = Deno.env.get("WIKI_TEST_DB_HOST");
 const ACCESS_KEY = "test-access-key";
 
-const fake = { failEmbeddings: false, breakWriter: false };
+const fake = { failEmbeddings: false, breakWriter: false, dropOrphans: false };
 
 function fakeEmbedding(text: string): number[] {
   const v = new Array(1536).fill(0);
@@ -131,10 +131,12 @@ function fakeChat(system: string, user: string): Record<string, unknown> {
     return { new_pages: pages };
   }
   if (system.includes("Assign every thought")) {
-    const assignments = [...user.matchAll(/\[#(\d+)\] [^\n]*\n([^\n]*)/g)].map(([, id, text]) => ({
-      id: Number(id),
-      pages: text.includes("Hotel") ? ["hotel-sofia"] : text.includes("Broken") ? ["broken-subject"] : [],
-    }));
+    const assignments = [...user.matchAll(/\[#(\d+)\] [^\n]*\n([^\n]*)/g)]
+      .filter(([, , text]) => !(fake.dropOrphans && text.includes("Orphan")))
+      .map(([, id, text]) => ({
+        id: Number(id),
+        pages: text.includes("Hotel") ? ["hotel-sofia"] : text.includes("Broken") ? ["broken-subject"] : [],
+      }));
     return { new_pages: [], assignments };
   }
   if (system.includes("compile one page")) {
@@ -212,7 +214,7 @@ Deno.test({
       const out = await new Deno.Command(Deno.execPath(), {
         args: ["run", "--no-lock", "--allow-net", "--allow-env", "--allow-read", "--allow-write=/tmp", "wiki_compile.ts", ...args],
         cwd: dir,
-        env: { ...env, WIKI_COMPILE_MODEL: "gpt-5.4-mini" },
+        env: { ...env, WIKI_COMPILE_MODEL: "gpt-5.4-mini", WIKI_COMPILE_SETTLE_SECONDS: "0" },
       }).output();
       const text = new TextDecoder().decode(out.stdout) + new TextDecoder().decode(out.stderr);
       assertEquals(out.code, 0, text);
@@ -442,6 +444,37 @@ Deno.test({
         assertStringIncludes(await Deno.readTextFile("/tmp/wiki-export-test/index.md"), "# Open Brain wiki");
         assertStringIncludes(await Deno.readTextFile("/tmp/wiki-export-test/log.md"), "compile #3 ok");
         await Deno.remove("/tmp/wiki-export-test", { recursive: true });
+      });
+
+      await t.step("drop_sources removes an uncited source only", async () => {
+        const body = "Closure date is 2026-10-10 [#2][#1]. See [[hotel-sofia]].\n\n## Notes\nUnique word zebracorn.\n\nMore text.";
+        assertStringIncludes(await ok("wiki_write", { slug: "test-page", body, drop_sources: [1] }), "No change");
+        const fixed = body.replace("[#2][#1]", "[#2]");
+        assertStringIncludes(await ok("wiki_write", { slug: "test-page", body: fixed, drop_sources: [1] }), "revision 5, 1 sources");
+        assertStringIncludes(await ok("wiki_read", { slug: "test-page" }), "sources (1 thoughts): #2");
+      });
+
+      await t.step("unassigned thoughts stay pending; pages without embeddings get one later", async () => {
+        fake.failEmbeddings = true;
+        try {
+          assertStringIncludes(await ok("wiki_write", { slug: "embed-later", title: "Embed later", body: "Text." }), "Created");
+        } finally {
+          fake.failEmbeddings = false;
+        }
+        await ok("capture_thought", { content: "Orphan note: Hotel Sofia changed its wifi password policy." });
+        fake.dropOrphans = true;
+        const partial = await compile();
+        assertStringIncludes(partial, "re-embedded 1 page(s)");
+        assertStringIncludes(partial, "Not assigned (retried next run): #6.");
+        assertStringIncludes(partial, "compile #4 partial");
+        assertStringIncludes(await ok("wiki_index"), "thoughts up to #5");
+        assertStringIncludes(await ok("wiki_read", { slug: "pending" }), "## [#6] ");
+
+        fake.dropOrphans = false;
+        const recovered = await compile();
+        assertStringIncludes(recovered, "updated hotel-sofia");
+        assertStringIncludes(recovered, "compile #5 ok");
+        assertStringIncludes(await ok("wiki_read", { slug: "pending" }), "0 thought(s) after the last compile (#6)");
       });
     } finally {
       server.kill("SIGTERM");

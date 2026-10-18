@@ -7,6 +7,7 @@ import {
   CATEGORIES,
   CITATION_PATTERN,
   compileStatus,
+  embedMissing,
   ensureWikiSchema,
   getPage,
   LINK_PATTERN,
@@ -39,6 +40,8 @@ const ROUTE_BATCH = 60;
 const ROUTE_EXCERPT_CHARS = 500;
 const CHUNK_CHARS = 40_000;
 const DUPLICATE_SIMILARITY = 0.9;
+// Thoughts younger than this are left for the next run, so a capture still committing is never skipped.
+const SETTLE_SECONDS = Number(env("WIKI_COMPILE_SETTLE_SECONDS", "60"));
 
 const USAGE = `Open Brain wiki compiler
 
@@ -518,8 +521,10 @@ async function lint(): Promise<string[]> {
 async function loadThoughts(after: number, limit: number): Promise<Thought[]> {
   const result = await withClient(pool, (c) =>
     c.queryObject<{ id: bigint; content: string; metadata: Record<string, unknown> | null; created_at: Date }>(
-      "SELECT id, content, metadata, created_at FROM thoughts WHERE id > $1 ORDER BY id LIMIT $2",
-      [after, limit],
+      `SELECT id, content, metadata, created_at FROM thoughts
+       WHERE id > $1 AND created_at < now() - make_interval(secs => $3::double precision)
+       ORDER BY id LIMIT $2`,
+      [after, limit, SETTLE_SECONDS],
     )
   );
   return result.rows.map((r) => ({ ...r, id: Number(r.id), metadata: r.metadata ?? {} }));
@@ -547,6 +552,8 @@ async function compile(opts: Options): Promise<void> {
       "UPDATE wiki_compile_runs SET status = 'failed', finished_at = now(), error = 'abandoned: the process ended before finishing' WHERE status = 'running'",
     )
   );
+  const reembedded = opts.dryRun ? 0 : await embedMissing(pool, getEmbedding);
+  if (reembedded) log(`re-embedded ${reembedded} page(s) that had no embedding`);
   const status = await withClient(pool, (c) => compileStatus(c));
   const thoughts = await loadThoughts(status.high_water_mark, opts.limit);
   if (!thoughts.length) {
@@ -614,11 +621,14 @@ async function compile(opts: Options): Promise<void> {
     });
 
     const findings = await lint();
-    const highWaterMark = failedIds.size ? Math.min(last, Math.min(...failedIds) - 1) : last;
+    const retry = [...failedIds, ...routing.unassigned];
+    const highWaterMark = retry.length ? Math.min(last, Math.min(...retry) - 1) : last;
+    const outcome = retry.length ? "partial" : "ok";
     const summary = [
       `${created.length} created, ${updated.length} updated${failed.length ? `, ${failed.length} failed (${failed.join(", ")})` : ""}.`,
       routing.noise.length ? `Skipped as noise: ${routing.noise.map((id) => `#${id}`).join(", ")}.` : "",
-      routing.unassigned.length ? `Not assigned: ${routing.unassigned.map((id) => `#${id}`).join(", ")}.` : "",
+      routing.unassigned.length ? `Not assigned (retried next run): ${routing.unassigned.map((id) => `#${id}`).join(", ")}.` : "",
+      reembedded ? `Re-embedded ${reembedded} page(s).` : "",
       ...findings,
       `Usage: ${usageLine()}.`,
     ].filter(Boolean).join(" ");
@@ -626,10 +636,10 @@ async function compile(opts: Options): Promise<void> {
       c.queryObject(
         `UPDATE wiki_compile_runs SET status = $2, finished_at = now(), to_thought_id = $3,
            pages_created = $4, pages_updated = $5, summary = $6 WHERE id = $1`,
-        [runId, failed.length ? "partial" : "ok", highWaterMark, created.length, updated.length, summary],
+        [runId, outcome, highWaterMark, created.length, updated.length, summary],
       )
     );
-    log(`compile #${runId} ${failed.length ? "partial" : "ok"}: ${summary}`);
+    log(`compile #${runId} ${outcome}: ${summary}`);
   } catch (err) {
     if (runId) {
       await withClient(pool, (c) =>
@@ -697,7 +707,7 @@ async function main(): Promise<void> {
   if (opts.status) return await printStatus();
   if (opts.exportDir) return await exportWiki(opts.exportDir);
   if (!CHAT_API_KEY) {
-    throw new Error("no chat API key configured (CHAT_API_KEY or EMBEDDING_API_KEY); run the manual compile in COMPILE_PROMPT.md instead");
+    throw new Error("no chat API key configured (CHAT_API_KEY or EMBEDDING_API_KEY); compile by hand through the MCP tools instead (wiki_read 'pending', then wiki_write)");
   }
 
   const lock = await pool.connect();

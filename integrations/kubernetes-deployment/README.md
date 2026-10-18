@@ -190,7 +190,7 @@ The server also sends MCP `instructions` telling clients when to use the wiki an
 
 ### Compile job
 
-`wiki_compile.ts` reads the thoughts captured after the last successful run (a high-water mark on thought ids), asks the chat model to plan pages and route each thought to one to three pages, then rewrites each affected page with the new thoughts (oldest first, `SUPERSEDES` and `RETRACTED` notes applied). Citations to ids the model was not given and links to unknown pages are stripped before the write. It ends with a lint pass (near-duplicate pages, broken links, pages nothing links to) recorded in the run summary and the `log` page. A page that fails keeps its thoughts pending for the next run; thoughts a page already cites are skipped, so re-runs are safe. Runs take an advisory lock, so two never overlap.
+`wiki_compile.ts` reads the thoughts captured after the last successful run (a high-water mark on thought ids), asks the chat model to plan pages and route each thought to one to three pages, then rewrites each affected page with the new thoughts (oldest first, `SUPERSEDES` and `RETRACTED` notes applied). Citations to ids the model was not given and links to unknown pages are stripped before the write. It ends with a lint pass (near-duplicate pages, broken links, pages nothing links to) recorded in the run summary and the `log` page. A page that fails, or a thought the model did not assign, stays pending for the next run (the run is recorded as `partial`); thoughts a page already cites are skipped, so re-runs are safe. Thoughts the model marks as noise are listed in the run summary and are not retried. Thoughts younger than `WIKI_COMPILE_SETTLE_SECONDS` (default 60) wait for the next run. Pages that have no embedding yet are embedded at the start of each run. Runs take an advisory lock, so two never overlap.
 
 ```bash
 # inside the running server container (it has the database and API settings)
@@ -200,7 +200,7 @@ deno run --allow-net --allow-env --allow-read wiki_compile.ts --status
 deno run --allow-net --allow-env --allow-read --allow-write=/tmp/wiki wiki_compile.ts --export /tmp/wiki
 ```
 
-The model is `--model`, else `WIKI_COMPILE_MODEL`, else `CHAT_MODEL`. `systemd/` holds a service and weekly timer that run the compile with `docker exec` in the container matched by `OB1_CONTAINER_FILTER`:
+The model is `--model`, else `WIKI_COMPILE_MODEL`, else `CHAT_MODEL`; use the provider's model id (`gpt-5.4-mini` on the OpenAI API, `openai/gpt-5.4-mini` on OpenRouter). `systemd/` holds a service and weekly timer that run the compile with `docker exec` in the container matched by `OB1_CONTAINER_FILTER`:
 
 ```bash
 cp systemd/ob1-wiki-compile.* /etc/systemd/system/
