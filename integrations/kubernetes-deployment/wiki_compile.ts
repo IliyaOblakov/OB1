@@ -256,7 +256,7 @@ Content rules:
 - Keep every durable fact already on the page unless a newer thought supersedes or retracts it: new thoughts add to the page, they do not replace it. Durable means it still matters next month: what the subject is, where it lives (paths, URLs, servers, repositories), who is involved, prices and terms, decisions, rules and milestones.
 - Drop intermediate statuses that later notes made obsolete (a PR that was opened and later merged needs only the merge).
 - Length follows the material: about 300 words for a small subject, up to about 1800 words for a large one with many thoughts.
-- Write in English; keep Bulgarian names and terms as written.
+- Write in English; keep Bulgarian names and terms as written. Do not use em dashes or en dashes: use a comma, a colon, parentheses or a plain hyphen.
 
 Body format (leave out empty sections; no title heading):
 <1-3 sentences: what this subject is and why it matters>
@@ -447,11 +447,16 @@ function cleanDraft(
       if (slug !== ctx.slug && ctx.linkable.has(slug)) return label ? `[[${slug}|${label}]]` : `[[${slug}]]`;
       return label?.trim() || slug.replace(/-/g, " ");
     })
+    .replace(/^(\s*-\s+\d{4}-\d{2}-\d{2}[^\n\u2013\u2014]*?)\s+[\u2013\u2014]\s+/gm, "$1: ")
+    .replace(/(\d)\s*[\u2013\u2014]\s*(\d)/g, "$1-$2")
+    .replace(/\s+[\u2013\u2014]\s+/g, ", ")
+    .replace(/[\u2013\u2014]/g, "-")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  const title = typeof raw.title === "string" && raw.title.trim() ? oneLine(raw.title, 200) : ctx.fallbackTitle;
-  const summary = typeof raw.summary === "string" ? oneLine(raw.summary, 200) : "";
+  const undash = (s: string) => s.replace(/\s+[\u2013\u2014]\s+/g, ", ").replace(/[\u2013\u2014]/g, "-");
+  const title = typeof raw.title === "string" && raw.title.trim() ? undash(oneLine(raw.title, 200)) : ctx.fallbackTitle;
+  const summary = typeof raw.summary === "string" ? undash(oneLine(raw.summary, 200)) : "";
   const extra = Array.isArray(raw.tags)
     ? raw.tags.filter((t): t is string => typeof t === "string" && !(CATEGORIES as readonly string[]).includes(t.trim().toLowerCase()))
     : [];

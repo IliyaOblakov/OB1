@@ -148,7 +148,7 @@ function fakeChat(system: string, user: string): Record<string, unknown> {
     const facts = ids.map((id) => `- Fact from thought ${id} [#${id}]`).join("\n");
     const body = current
       ? `${current}\n${facts}`
-      : `# Should be stripped\n\nIntro sentence. [#999999]\n\n## Current state\n${facts}\n\nSee [[test-page]] and [[no-such-page]].`;
+      : `# Should be stripped\n\nIntro sentence \u2014 with a dash. [#999999]\n\n## Current state\n${facts}\n\n## History\n- 2026-10-01 \u2013 opened for 10\u201312 guests\n\nSee [[test-page]] and [[no-such-page]].`;
     return { title: slug === "hotel-sofia" ? "Hotel Sofia" : "Broken subject", summary: `Summary of ${slug}`, tags: ["client", "Hotel"], body };
   }
   throw new Error(`unexpected chat prompt: ${system.slice(0, 60)}`);
@@ -399,6 +399,9 @@ Deno.test({
         assertStringIncludes(page, "See [[test-page]] and no such page.");
         assert(!page.includes("999999"), "invalid citation was not stripped");
         assert(!page.includes("Should be stripped"), "leading title heading was not stripped");
+        assertStringIncludes(page, "Intro sentence, with a dash.");
+        assertStringIncludes(page, "- 2026-10-01: opened for 10-12 guests");
+        assert(!/[\u2013\u2014]/.test(page), "dashes must be normalised");
 
         const index = await ok("wiki_index");
         assertStringIncludes(index, "2 page(s). Last compile:");
