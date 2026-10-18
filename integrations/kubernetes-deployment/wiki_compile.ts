@@ -624,10 +624,11 @@ async function lint(): Promise<string[]> {
     const orphans = await c.queryObject<{ slug: string }>(
       `SELECT p.slug FROM wiki_pages p
        WHERE NOT EXISTS (SELECT 1 FROM wiki_pages q WHERE q.slug <> p.slug AND q.links @> ARRAY[p.slug])
+         AND NOT EXISTS (SELECT 1 FROM wiki_pages q WHERE p.slug LIKE q.slug || '-%')
        ORDER BY 1 LIMIT 30`,
     );
     if (orphans.rows.length) {
-      findings.push(`Not linked from any other page: ${orphans.rows.map((r) => `[[${r.slug}]]`).join(", ")}.`);
+      findings.push(`Top-level pages no other page links to: ${orphans.rows.map((r) => `[[${r.slug}]]`).join(", ")}.`);
     }
     return findings;
   });

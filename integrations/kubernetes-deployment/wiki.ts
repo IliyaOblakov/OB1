@@ -340,6 +340,19 @@ export async function backlinks(client: PoolClient, slug: string): Promise<strin
   return result.rows.map((r) => r.slug);
 }
 
+// Sub-pages extend their parent's slug ("hotel-sofia-payments" under "hotel-sofia").
+export async function pageFamily(client: PoolClient, slug: string): Promise<{ parent: string | null; children: string[] }> {
+  const result = await client.queryObject<{ slug: string }>(
+    "SELECT slug FROM wiki_pages WHERE (slug LIKE $1 || '-%' OR $1 LIKE slug || '-%') AND slug <> $1 ORDER BY slug",
+    [slug],
+  );
+  const related = result.rows.map((r) => r.slug);
+  const ancestors = related.filter((s) => slug.startsWith(`${s}-`)).sort((a, b) => b.length - a.length);
+  const descendants = related.filter((s) => s.startsWith(`${slug}-`));
+  const children = descendants.filter((d) => !descendants.some((o) => o !== d && d.startsWith(`${o}-`)));
+  return { parent: ancestors[0] ?? null, children };
+}
+
 async function missingSlugs(client: PoolClient, slugs: string[]): Promise<string[]> {
   if (!slugs.length) return [];
   const result = await client.queryObject<{ slug: string }>(
@@ -824,6 +837,7 @@ async function readPageText(
   }
 
   const inbound = await backlinks(client, slug);
+  const { parent, children } = await pageFamily(client, slug);
   const missing = new Set(await missingSlugs(client, page.links));
   const links = page.links.map((l) => (missing.has(l) ? `[[${l}]] (missing)` : `[[${l}]]`));
   return [
@@ -832,6 +846,9 @@ async function readPageText(
     `summary: ${page.summary || "(none)"}`,
     `sources (${page.sources.length} thoughts): ${formatIds(page.sources) || "none"}`,
     `links: ${links.join(", ") || "none"} | linked from: ${inbound.map((l) => `[[${l}]]`).join(", ") || "none"}`,
+    ...(parent || children.length
+      ? [`parent: ${parent ? `[[${parent}]]` : "none"} | sub-pages: ${children.map((c) => `[[${c}]]`).join(", ") || "none"}`]
+      : []),
     "",
     "---",
     "",

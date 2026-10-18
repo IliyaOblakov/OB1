@@ -513,6 +513,17 @@ Deno.test({
         }
         assertStringIncludes(await ok("wiki_index"), "thoughts up to #7");
       });
+
+      await t.step("wiki_read shows parent and sub-pages from slugs", async () => {
+        await ok("wiki_write", { slug: "hotel-sofia-spa", title: "Hotel Sofia spa", body: "Spa plans." });
+        await ok("wiki_write", { slug: "hotel-sofia-spa-sauna", title: "Sauna", body: "Sauna plans." });
+        assertStringIncludes(await ok("wiki_read", { slug: "hotel-sofia" }), "parent: none | sub-pages: [[hotel-sofia-spa]]\n");
+        assertStringIncludes(
+          await ok("wiki_read", { slug: "hotel-sofia-spa" }),
+          "parent: [[hotel-sofia]] | sub-pages: [[hotel-sofia-spa-sauna]]",
+        );
+        assert(!(await ok("wiki_read", { slug: "test-page" })).includes("sub-pages:"), "unrelated pages get no family line");
+      });
     } finally {
       server.kill("SIGTERM");
       await server.status;
