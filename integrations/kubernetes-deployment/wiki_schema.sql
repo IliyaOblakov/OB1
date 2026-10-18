@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS wiki_pages (
 CREATE INDEX IF NOT EXISTS idx_wiki_pages_search ON wiki_pages USING GIN (search_tsv);
 CREATE INDEX IF NOT EXISTS idx_wiki_pages_tags ON wiki_pages USING GIN (tags);
 CREATE INDEX IF NOT EXISTS idx_wiki_pages_links ON wiki_pages USING GIN (links);
+CREATE INDEX IF NOT EXISTS idx_wiki_pages_sources ON wiki_pages USING GIN (sources);
 CREATE INDEX IF NOT EXISTS idx_wiki_pages_updated_at ON wiki_pages (updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS wiki_revisions (

@@ -234,7 +234,8 @@ Content rules:
 - Use only facts stated in the current page or in the thoughts, and only the parts of a thought that concern this page's subject. No speculation, filler or advice.
 - Newer information wins. "SUPERSEDES earlier notes on X" replaces the older claims it names: update the fact, do not list both versions. "RETRACTED" means remove the content it names.
 - End every factual bullet or sentence with citations of the thoughts it comes from, like [#123] or [#123][#140]. Keep the citations of facts you keep. Cite only ids you were given.
-- Write dates as YYYY-MM-DD (add a time only when it matters). Keep exact names, paths, URLs, ids, versions, numbers and amounts. Never include secrets (keys, passwords, tokens), even if a thought contains one.
+- Write dates as YYYY-MM-DD (add a time only when it matters). Keep exact names, paths, URLs, versions, numbers and amounts. Keep commit hashes, session ids and file hashes only when someone will need them later (the current main commit, a live deployment), not for superseded intermediate steps. Never include secrets (keys, passwords, tokens), even if a thought contains one.
+- Refer to the owner as Iliya (the notes often say "the user").
 - Link other wiki pages as [[slug]], only with slugs from the list, where the text mentions that subject. Do not link the page to itself.
 - Keep it current and compact, at most about 1200 words: drop intermediate statuses that later notes made obsolete; keep durable facts, decisions, rules and milestone dates.
 - Write in English; keep Bulgarian names and terms as written.

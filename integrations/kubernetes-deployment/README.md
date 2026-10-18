@@ -172,6 +172,46 @@ After deployment you should see:
 
 > **Tool hygiene:** This integration adds MCP tools to your AI's context window. As your deployment grows, the total tool count grows — and with it, the context cost and risk of your AI picking the wrong tool. See the [MCP Tool Audit & Optimization Guide](../../docs/05-tool-audit.md) for strategies on auditing, merging, and scoping your tools.
 
+## Wiki
+
+The server also keeps a compiled wiki: markdown pages about the durable subjects in your thoughts (projects, clients, people, servers, rules), current state first, every fact cited as `[#thought-id]`. Thoughts stay the append-only source of truth; the wiki is rebuilt from them by a compile job. The tables (`wiki_pages`, `wiki_revisions`, `wiki_compile_runs`, see `wiki_schema.sql`) are created automatically on first use; `thoughts` is not changed.
+
+MCP tools on the same endpoint and key:
+
+| Tool | Purpose |
+|------|---------|
+| `wiki_index` | Table of contents grouped by category, sub-pages nested under their parent, plus compile status and the number of thoughts not compiled yet |
+| `wiki_list` | Page list with one-line summaries; filter by tag or category, or pages updated in the last N days |
+| `wiki_read` | One page with sources, links and backlinks; an older `revision` or `history=true`. Built-in pages: `index`, `log` (changes), `pending` (thoughts no page cites yet) |
+| `wiki_search` | Full-text (Postgres `simple` config, works for any language) plus embedding similarity, merged by reciprocal rank fusion |
+| `wiki_write` | Create or update a page; every write stores a revision. `expected_revision` prevents lost updates, `append=true` adds to the end |
+
+The server also sends MCP `instructions` telling clients when to use the wiki and when to use raw thoughts.
+
+### Compile job
+
+`wiki_compile.ts` reads the thoughts captured after the last successful run (a high-water mark on thought ids), asks the chat model to plan pages and route each thought to one to three pages, then rewrites each affected page with the new thoughts (oldest first, `SUPERSEDES` and `RETRACTED` notes applied). Citations to ids the model was not given and links to unknown pages are stripped before the write. It ends with a lint pass (near-duplicate pages, broken links, pages nothing links to) recorded in the run summary and the `log` page. A page that fails keeps its thoughts pending for the next run; thoughts a page already cites are skipped, so re-runs are safe. Runs take an advisory lock, so two never overlap.
+
+```bash
+# inside the running server container (it has the database and API settings)
+deno run --allow-net --allow-env --allow-read wiki_compile.ts --dry-run   # plan only
+deno run --allow-net --allow-env --allow-read wiki_compile.ts             # compile
+deno run --allow-net --allow-env --allow-read wiki_compile.ts --status
+deno run --allow-net --allow-env --allow-read --allow-write=/tmp/wiki wiki_compile.ts --export /tmp/wiki
+```
+
+The model is `--model`, else `WIKI_COMPILE_MODEL`, else `CHAT_MODEL`. `systemd/` holds a service and weekly timer that run the compile with `docker exec` in the container matched by `OB1_CONTAINER_FILTER`:
+
+```bash
+cp systemd/ob1-wiki-compile.* /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now ob1-wiki-compile.timer
+journalctl -u ob1-wiki-compile.service   # last run
+```
+
+### Tests
+
+`./test.sh` starts a throwaway pgvector container and runs `wiki_test.ts`: unit tests, then the real server and compile job against the database with a fake OpenAI-compatible API (old tools, every wiki tool, revisions, conflicts, search fallback, compile recovery, export). Everything it starts is removed afterwards.
+
 ## Troubleshooting
 
 **Pod stuck in CrashLoopBackOff (mcp-server)**

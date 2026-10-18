@@ -92,7 +92,7 @@ const CATEGORY_HEADINGS: Record<string, string> = {
   other: "Other",
 };
 
-export const VIRTUAL_PAGES = ["index", "log"];
+export const VIRTUAL_PAGES = ["index", "log", "pending"];
 
 const SLUG_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 export const LINK_PATTERN = /\[\[([^\]|\n]+)(?:\|([^\]\n]*))?\]\]/g;
@@ -195,23 +195,37 @@ export function renderIndex(pages: PageListing[], status: CompileStatus): string
   const lines = [
     "# Open Brain wiki",
     "",
-    "Compiled from Open Brain thoughts: one page per durable subject, current state first, facts cited as [#thought-id]. Read a page with wiki_read, search with wiki_search; `log` lists recent changes.",
+    "Compiled from Open Brain thoughts: one page per durable subject, current state first, facts cited as [#thought-id]. Read a page with wiki_read, search with wiki_search; `log` lists recent changes and `pending` the thoughts no page covers yet.",
     "",
     `${pages.length} page(s). ${compileLine(status)}`,
   ];
 
+  // A page whose slug extends another page's slug ("hotel-sofia-payments") is listed under it.
+  const slugs = new Set(pages.map((p) => p.slug));
+  const parentOf = (slug: string) => {
+    for (let cut = slug.lastIndexOf("-"); cut > 0; cut = slug.lastIndexOf("-", cut - 1)) {
+      if (slugs.has(slug.slice(0, cut))) return slug.slice(0, cut);
+    }
+    return null;
+  };
+  const children = new Map<string, PageListing[]>();
   const groups = new Map<string, PageListing[]>();
   for (const page of pages) {
-    const category = categoryOf(page.tags);
-    groups.set(category, [...(groups.get(category) ?? []), page]);
+    const parent = parentOf(page.slug);
+    const key = parent ?? categoryOf(page.tags);
+    const target = parent ? children : groups;
+    target.set(key, [...(target.get(key) ?? []), page]);
   }
+  const byTitle = (a: PageListing, b: PageListing) => a.title.localeCompare(b.title);
+  const entry = (page: PageListing, depth: number): void => {
+    lines.push(`${"  ".repeat(depth)}- [[${page.slug}]] ${page.title}${page.summary ? `: ${page.summary}` : ""}`);
+    for (const child of (children.get(page.slug) ?? []).sort(byTitle)) entry(child, depth + 1);
+  };
   for (const category of [...CATEGORIES, "other"]) {
     const group = groups.get(category);
     if (!group?.length) continue;
     lines.push("", `## ${CATEGORY_HEADINGS[category]} (${group.length})`);
-    for (const page of group.sort((a, b) => a.title.localeCompare(b.title))) {
-      lines.push(`- [[${page.slug}]] ${page.title}${page.summary ? `: ${page.summary}` : ""}`);
-    }
+    for (const page of group.sort(byTitle)) entry(page, 0);
   }
 
   const recent = [...pages].sort((a, b) => +b.updated_at - +a.updated_at).slice(0, 10);
@@ -695,6 +709,27 @@ export async function renderLog(client: PoolClient, limit = 50): Promise<string>
   return lines.join("\n");
 }
 
+export async function renderPending(client: PoolClient, limit = 50): Promise<string> {
+  const { high_water_mark } = await compileStatus(client);
+  const uncovered = `FROM thoughts t
+     WHERE t.id > $1 AND NOT EXISTS (SELECT 1 FROM wiki_pages p WHERE p.sources @> ARRAY[t.id])`;
+  const total = await client.queryObject<{ count: number }>(`SELECT COUNT(*)::int AS count ${uncovered}`, [high_water_mark]);
+  const rows = await client.queryObject<{ id: bigint; content: string; created_at: Date }>(
+    `SELECT t.id, t.content, t.created_at ${uncovered} ORDER BY t.id LIMIT $2`,
+    [high_water_mark, limit],
+  );
+  const count = total.rows[0]?.count ?? 0;
+  const lines = [
+    "# Open Brain wiki: pending thoughts",
+    "",
+    `${count} thought(s) after the last compile (#${high_water_mark}) are not cited by any page yet.${count > rows.rows.length ? ` Showing the oldest ${rows.rows.length}.` : ""}`,
+  ];
+  for (const row of rows.rows) {
+    lines.push("", `## [#${Number(row.id)}] ${stamp(row.created_at)}`, "", row.content.trim());
+  }
+  return lines.join("\n");
+}
+
 export async function buildIndex(client: PoolClient): Promise<string> {
   return renderIndex(await listPages(client), await compileStatus(client));
 }
@@ -713,6 +748,7 @@ async function readPageText(
   const limit = Math.min(Math.max(1, Math.floor(opts.limit ?? 50)), 500);
   if (slug === "index") return await buildIndex(client);
   if (slug === "log") return await renderLog(client, limit);
+  if (slug === "pending") return await renderPending(client, limit);
 
   const page = await getPage(client, slug);
   if (!page) {
@@ -841,7 +877,7 @@ export function registerWikiTools(server: McpServer, ctx: WikiContext): void {
     {
       title: "Read Wiki Page",
       description:
-        "Read one wiki page by slug: compiled markdown (current state, key facts, decisions, history) with [#id] thought citations, [[slug]] links and backlinks. Built-in pages: 'index' (table of contents) and 'log' (recent changes). Optional: an older revision number, or history=true for the revision list. For anything newer than the page's updated date, also check search_thoughts.",
+        "Read one wiki page by slug: compiled markdown (current state, key facts, decisions, history) with [#id] thought citations, [[slug]] links and backlinks. Built-in pages: 'index' (table of contents), 'log' (recent changes) and 'pending' (thoughts not compiled into any page yet, with ids and full text). Optional: an older revision number, or history=true for the revision list. For anything newer than the page's updated date, also check search_thoughts.",
       annotations: { readOnlyHint: true },
       inputSchema: {
         slug: z.string().describe("Page slug, for example 'hotel-sofia', or 'index' / 'log'"),

@@ -27,6 +27,7 @@ Deno.test("slugError accepts kebab-case and rejects the rest", () => {
   assertMatch(slugError("x".repeat(81))!, /invalid slug/);
   assertMatch(slugError("index")!, /built-in/);
   assertMatch(slugError("log")!, /built-in/);
+  assertMatch(slugError("pending")!, /built-in/);
   assertMatch(slugError("")!, /required/);
 });
 
@@ -72,16 +73,31 @@ Deno.test("renderIndex groups pages by category and reports pending thoughts", (
     updated_by: "compile",
     source_count: 2,
   });
-  const text = renderIndex([page("hotel-sofia", ["client"]), page("hub", ["project"]), page("misc", [])], {
+  const pages = [
+    page("hotel-sofia", ["client"]),
+    page("hotel-sofia-payments", ["topic"]),
+    page("hotel-sofia-payments-stripe", ["topic"]),
+    page("hub", ["project"]),
+    page("misc", []),
+  ];
+  const text = renderIndex(pages, {
     last_ok: { id: 4, status: "ok", finished_at: new Date("2026-10-18T10:00:00Z"), to_thought_id: 976, model: "m" },
     last_attempt: { id: 4, status: "ok", started_at: new Date("2026-10-18T09:00:00Z"), error: null },
     high_water_mark: 976,
     pending: 7,
   });
-  assertStringIncludes(text, "3 page(s). Last compile: 2026-10-18 10:00 UTC (run #4, ok, thoughts up to #976).");
+  assertStringIncludes(text, "5 page(s). Last compile: 2026-10-18 10:00 UTC (run #4, ok, thoughts up to #976).");
   assertStringIncludes(text, "7 thought(s) captured since then are not in the wiki yet");
   assert(text.indexOf("## Projects (1)") < text.indexOf("## Clients (1)"));
-  assertStringIncludes(text, "- [[hotel-sofia]] HOTEL-SOFIA: about hotel-sofia");
+  assertStringIncludes(
+    text,
+    [
+      "- [[hotel-sofia]] HOTEL-SOFIA: about hotel-sofia",
+      "  - [[hotel-sofia-payments]] HOTEL-SOFIA-PAYMENTS: about hotel-sofia-payments",
+      "    - [[hotel-sofia-payments-stripe]] HOTEL-SOFIA-PAYMENTS-STRIPE: about hotel-sofia-payments-stripe",
+    ].join("\n"),
+  );
+  assert(!text.includes("## Topics"), "sub-pages should be nested, not listed under their own category");
   assertStringIncludes(text, "## Other (1)");
 });
 
@@ -350,6 +366,15 @@ Deno.test({
         }
       });
 
+      await t.step("pending lists thoughts no page cites yet", async () => {
+        const pending = await ok("wiki_read", { slug: "pending" });
+        assertStringIncludes(pending, "1 thought(s) after the last compile (#0) are not cited by any page yet.");
+        assertStringIncludes(pending, "## [#3] ");
+        assertStringIncludes(pending, "Random note about nothing in particular.");
+        assert(!pending.includes("[#1]") && !pending.includes("[#2]"), "cited thoughts should not be pending");
+        assertMatch((await call("wiki_write", { slug: "pending", title: "x", body: "y" })).text, /built-in/);
+      });
+
       await t.step("wiki_list filters and sorts", async () => {
         assertStringIncludes(await ok("wiki_list"), "- test-page: Test page. A page written by the test (topic, rev 4");
         assertStringIncludes(await ok("wiki_list", { tag: "testing", sort: "updated", days: 1 }), "1 wiki page(s)");
@@ -383,6 +408,7 @@ Deno.test({
         assertStringIncludes(changes, "Skipped as noise: #3.");
         assertMatch(changes, /\[\[test-page\]\] rev 1 by wiki-test: first/);
 
+        assertStringIncludes(await ok("wiki_read", { slug: "pending" }), "0 thought(s) after the last compile (#3)");
         assertStringIncludes(await compile(), "No new thoughts since the last compile (high-water mark #3)");
       });
 

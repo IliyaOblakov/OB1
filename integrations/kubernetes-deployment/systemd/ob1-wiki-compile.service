@@ -1,0 +1,11 @@
+[Unit]
+Description=Open Brain wiki compile
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=3h
+Environment=OB1_CONTAINER_FILTER=label=coolify.resourceName=openbrain-mcp
+Environment=WIKI_COMPILE_MODEL=gpt-5.4-mini
+ExecStart=/bin/sh -c 'c=$(docker ps -q --filter "$OB1_CONTAINER_FILTER" | head -n 1); [ -n "$c" ] || { echo "no running container matches $OB1_CONTAINER_FILTER" >&2; exit 1; }; exec docker exec "$c" deno run --allow-net --allow-env --allow-read wiki_compile.ts --model "$WIKI_COMPILE_MODEL"'
