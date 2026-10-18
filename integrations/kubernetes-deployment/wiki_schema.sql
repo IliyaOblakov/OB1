@@ -56,3 +56,5 @@ CREATE TABLE IF NOT EXISTS wiki_compile_runs (
     summary TEXT NOT NULL DEFAULT '',
     error TEXT
 );
+
+ALTER TABLE wiki_compile_runs ADD COLUMN IF NOT EXISTS unassigned BIGINT[] NOT NULL DEFAULT '{}';

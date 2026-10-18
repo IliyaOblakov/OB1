@@ -41,7 +41,8 @@ const ROUTE_EXCERPT_CHARS = 500;
 const CHUNK_CHARS = 40_000;
 const DUPLICATE_SIMILARITY = 0.9;
 // Thoughts younger than this are left for the next run, so a capture still committing is never skipped.
-const SETTLE_SECONDS = Number(env("WIKI_COMPILE_SETTLE_SECONDS", "60"));
+const settle = Number(env("WIKI_COMPILE_SETTLE_SECONDS", "60"));
+const SETTLE_SECONDS = Number.isFinite(settle) && settle >= 0 ? settle : 60;
 
 const USAGE = `Open Brain wiki compiler
 
@@ -565,6 +566,12 @@ async function compile(opts: Options): Promise<void> {
   log(`${thoughts.length} new thought(s), #${first}-#${last}; model ${opts.model}${opts.dryRun ? "; dry run" : ""}`);
 
   const catalog = await loadCatalog();
+  const previous = await withClient(pool, (c) =>
+    c.queryObject<{ unassigned: unknown[] }>(
+      "SELECT unassigned FROM wiki_compile_runs WHERE status IN ('ok', 'partial') ORDER BY id DESC LIMIT 1",
+    )
+  );
+  const unassignedBefore = new Set((previous.rows[0]?.unassigned ?? []).map(Number));
   let runId = 0;
   if (!opts.dryRun) {
     const started = await withClient(pool, (c) =>
@@ -621,13 +628,17 @@ async function compile(opts: Options): Promise<void> {
     });
 
     const findings = await lint();
-    const retry = [...failedIds, ...routing.unassigned];
+    // A thought left unassigned by two runs in a row is given up, so it cannot pin the mark forever.
+    const givenUp = routing.unassigned.filter((id) => unassignedBefore.has(id));
+    const unassigned = routing.unassigned.filter((id) => !unassignedBefore.has(id));
+    const retry = [...failedIds, ...unassigned];
     const highWaterMark = retry.length ? Math.min(last, Math.min(...retry) - 1) : last;
     const outcome = retry.length ? "partial" : "ok";
     const summary = [
       `${created.length} created, ${updated.length} updated${failed.length ? `, ${failed.length} failed (${failed.join(", ")})` : ""}.`,
       routing.noise.length ? `Skipped as noise: ${routing.noise.map((id) => `#${id}`).join(", ")}.` : "",
-      routing.unassigned.length ? `Not assigned (retried next run): ${routing.unassigned.map((id) => `#${id}`).join(", ")}.` : "",
+      unassigned.length ? `Not assigned (retried next run): ${unassigned.map((id) => `#${id}`).join(", ")}.` : "",
+      givenUp.length ? `Not assigned twice, given up: ${givenUp.map((id) => `#${id}`).join(", ")}.` : "",
       reembedded ? `Re-embedded ${reembedded} page(s).` : "",
       ...findings,
       `Usage: ${usageLine()}.`,
@@ -635,8 +646,8 @@ async function compile(opts: Options): Promise<void> {
     await withClient(pool, (c) =>
       c.queryObject(
         `UPDATE wiki_compile_runs SET status = $2, finished_at = now(), to_thought_id = $3,
-           pages_created = $4, pages_updated = $5, summary = $6 WHERE id = $1`,
-        [runId, outcome, highWaterMark, created.length, updated.length, summary],
+           pages_created = $4, pages_updated = $5, summary = $6, unassigned = $7::bigint[] WHERE id = $1`,
+        [runId, outcome, highWaterMark, created.length, updated.length, summary, unassigned],
       )
     );
     log(`compile #${runId} ${outcome}: ${summary}`);

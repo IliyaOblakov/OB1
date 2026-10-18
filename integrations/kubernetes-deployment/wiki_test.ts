@@ -475,6 +475,18 @@ Deno.test({
         assertStringIncludes(recovered, "updated hotel-sofia");
         assertStringIncludes(recovered, "compile #5 ok");
         assertStringIncludes(await ok("wiki_read", { slug: "pending" }), "0 thought(s) after the last compile (#6)");
+
+        await ok("capture_thought", { content: "Orphan note two: Hotel Sofia never gets routed." });
+        fake.dropOrphans = true;
+        try {
+          assertStringIncludes(await compile(), "compile #6 partial");
+          const givenUp = await compile();
+          assertStringIncludes(givenUp, "Not assigned twice, given up: #7.");
+          assertStringIncludes(givenUp, "compile #7 ok");
+        } finally {
+          fake.dropOrphans = false;
+        }
+        assertStringIncludes(await ok("wiki_index"), "thoughts up to #7");
       });
     } finally {
       server.kill("SIGTERM");
