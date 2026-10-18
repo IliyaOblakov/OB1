@@ -38,7 +38,7 @@ const PLAN_BATCH = 1_500;
 const PLAN_EXCERPT_CHARS = 200;
 const ROUTE_BATCH = 60;
 const ROUTE_EXCERPT_CHARS = 500;
-const CHUNK_CHARS = 40_000;
+const CHUNK_CHARS = 160_000;
 const DUPLICATE_SIMILARITY = 0.9;
 // Thoughts younger than this are left for the next run, so a capture still committing is never skipped.
 const settle = Number(env("WIKI_COMPILE_SETTLE_SECONDS", "60"));
@@ -54,6 +54,7 @@ Options:
   --concurrency N     pages written in parallel (default 4)
   --dry-run           plan and route only; print the assignment, write nothing
   --status            print the compile status and exit
+  --rebuild SLUGS     rewrite pages from all their sources: comma-separated slugs or "all" (--dry-run prints them)
   --export DIR        write every page plus index.md and log.md to DIR (needs --allow-write=DIR)
   --help              show this text`;
 
@@ -72,6 +73,7 @@ type Options = {
   dryRun: boolean;
   status: boolean;
   exportDir: string | null;
+  rebuild: string | null;
   help: boolean;
 };
 
@@ -117,6 +119,7 @@ function parseOptions(args: string[]): Options {
     dryRun: false,
     status: false,
     exportDir: null,
+    rebuild: null,
     help: false,
   };
   for (let i = 0; i < args.length; i++) {
@@ -133,6 +136,7 @@ function parseOptions(args: string[]): Options {
       case "--dry-run": opts.dryRun = true; break;
       case "--status": opts.status = true; break;
       case "--export": opts.exportDir = value(); break;
+      case "--rebuild": opts.rebuild = value(); break;
       case "--help": case "-h": opts.help = true; break;
       default: throw new Error(`unknown argument ${flag} (see --help)`);
     }
@@ -232,7 +236,7 @@ Return JSON only:
  "assignments": [{"id": 123, "pages": ["primary-slug", "other-slug"]}]}
 Every thought id in the batch appears exactly once in assignments.`;
 
-const WRITE_SYSTEM = `You compile one page of the Open Brain wiki, a markdown knowledge base built from the captured notes ("thoughts") of Iliya Oblakov's AI sessions (Claude Code, Codex and others). You get the page's current text (empty for a new page), the list of other pages, and new thoughts for this page, oldest first. Return the complete updated page.
+const WRITE_SYSTEM = `You compile one page of the Open Brain wiki, a markdown knowledge base built from the captured notes ("thoughts") of Iliya Oblakov's AI sessions (Claude Code, Codex and others). You get the page's current text (empty for a new page), the list of other pages, and thoughts for this page, oldest first. Return the complete updated page.
 
 Content rules:
 - Use only facts stated in the current page or in the thoughts, and only the parts of a thought that concern this page's subject. No speculation, filler or advice.
@@ -241,7 +245,9 @@ Content rules:
 - Write dates as YYYY-MM-DD (add a time only when it matters). Keep exact names, paths, URLs, versions, numbers and amounts. Keep commit hashes, session ids and file hashes only when someone will need them later (the current main commit, a live deployment), not for superseded intermediate steps. Never include secrets (keys, passwords, tokens), even if a thought contains one.
 - Refer to the owner as Iliya (the notes often say "the user").
 - Link other wiki pages as [[slug]], only with slugs from the list, where the text mentions that subject. Do not link the page to itself.
-- Keep it current and compact, at most about 1200 words: drop intermediate statuses that later notes made obsolete; keep durable facts, decisions, rules and milestone dates.
+- Keep every durable fact already on the page unless a newer thought supersedes or retracts it: new thoughts add to the page, they do not replace it. Durable means it still matters next month: what the subject is, where it lives (paths, URLs, servers, repositories), who is involved, prices and terms, decisions, rules and milestones.
+- Drop intermediate statuses that later notes made obsolete (a PR that was opened and later merged needs only the merge).
+- Length follows the material: about 300 words for a small subject, up to about 1800 words for a large one with many thoughts.
 - Write in English; keep Bulgarian names and terms as written.
 
 Body format (leave out empty sections; no title heading):
@@ -252,7 +258,7 @@ Body format (leave out empty sections; no title heading):
 ## Decisions and rules
 ## Open items
 ## History
-<dated milestones, newest first, one line each>
+<dated milestones over the whole life of the subject, newest first, one line each; fold routine steps of the same week into one line instead of dropping them>
 
 Return JSON only:
 {"title": "...", "summary": "<one line under 140 characters: what it is and its current state>", "tags": ["<category>", "<2-5 short lowercase topic tags>"], "body": "<markdown>"}`;
@@ -278,16 +284,31 @@ function excerpt(thought: Thought, chars: number): string {
   return `[#${thought.id}] ${thought.created_at.toISOString().slice(0, 10)} | topics: ${topics(thought)}\n${oneLine(thought.content, chars)}`;
 }
 
-function writePrompt(slug: string, entry: Entry, page: WikiPage | null, part: Thought[], run: Run): string {
+type PageText = Pick<WikiPage, "title" | "summary" | "tags" | "body">;
+
+function writePrompt(
+  slug: string,
+  entry: Entry,
+  page: PageText | null,
+  part: Thought[],
+  run: Run,
+  opts: { total?: number; rebuild?: boolean } = {},
+): string {
   const others = new Map([...run.catalog].filter(([s]) => s !== slug && run.linkable.has(s)));
   const lines = [
     `Page slug: ${slug}`,
     `Category: ${entry.category} (keep it as the first tag)`,
   ];
   if (entry.parent) lines.push(`Parent page: [[${entry.parent}]] (link to it)`);
+  if (opts.rebuild) {
+    lines.push("Rebuild: the current text may be incomplete. Rebuild the page from all of its thoughts below, and keep corrections from the current text unless a thought contradicts them.");
+  }
+  if (opts.total && opts.total > part.length) {
+    lines.push(`This page draws on ${opts.total} thoughts in total; this request contains ${part.length} of them.`);
+  }
   if (page) {
     lines.push(
-      `Current revision ${page.revision}. Title: ${page.title}. Summary: ${page.summary}. Tags: ${page.tags.join(", ")}`,
+      `Current title: ${page.title}. Summary: ${page.summary}. Tags: ${page.tags.join(", ")}`,
       "Current body:",
       "<<<",
       page.body,
@@ -297,7 +318,7 @@ function writePrompt(slug: string, entry: Entry, page: WikiPage | null, part: Th
     lines.push(`New page. Proposed title: ${entry.title}. Proposed summary: ${entry.summary}`);
   }
   lines.push("", "Other wiki pages (slug | title):", catalogLines(others, false), "");
-  lines.push(`New thoughts for this page (${part.length}, oldest first):`);
+  lines.push(`Thoughts for this page (${part.length}, oldest first):`);
   for (const t of part) {
     lines.push("", `=== [#${t.id}] captured ${stamp(t.created_at)} ===`, t.content.trim());
   }
@@ -477,6 +498,99 @@ async function compilePage(slug: string, ids: number[], run: Run): Promise<"crea
   return existed ? "updated" : "created";
 }
 
+async function loadThoughtsById(ids: number[]): Promise<Thought[]> {
+  const result = await withClient(pool, (c) =>
+    c.queryObject<{ id: bigint; content: string; metadata: Record<string, unknown> | null; created_at: Date }>(
+      "SELECT id, content, metadata, created_at FROM thoughts WHERE id = ANY($1::bigint[]) ORDER BY id",
+      [ids],
+    )
+  );
+  return result.rows.map((r) => ({ ...r, id: Number(r.id), metadata: r.metadata ?? {} }));
+}
+
+async function rebuildPage(slug: string, run: Run, dryRun: boolean): Promise<void> {
+  const page = (await withClient(pool, (c) => getPage(c, slug)))!;
+  const entry = run.catalog.get(slug)!;
+  const thoughts = await loadThoughtsById(page.sources);
+  let current: PageText = page;
+  for (const part of chunkByChars(thoughts, CHUNK_CHARS)) {
+    const raw = await chatJSON<Partial<Draft>>(
+      run.model,
+      "medium",
+      WRITE_SYSTEM,
+      writePrompt(slug, entry, current, part, run, { total: thoughts.length, rebuild: current === page }),
+    );
+    current = cleanDraft(raw, {
+      slug,
+      category: entry.category,
+      fallbackTitle: page.title,
+      allowedIds: new Set(page.sources),
+      linkable: run.linkable,
+    });
+  }
+  if (dryRun) {
+    console.log(`\n===== ${slug} =====\n# ${current.title}\nsummary: ${current.summary}\ntags: ${current.tags.join(", ")}\n\n${current.body}`);
+    return;
+  }
+  await writePage(pool, getEmbedding, {
+    slug,
+    ...current,
+    expected_revision: page.revision,
+    author: "compile",
+    note: `compile #${run.id}: rebuilt from ${thoughts.length} thought(s)`,
+    compile_run_id: run.id,
+  });
+}
+
+async function rebuild(target: string, opts: Options): Promise<void> {
+  const catalog = await loadCatalog();
+  const slugs = target === "all" ? [...catalog.keys()] : target.split(",").map((s) => s.trim()).filter(Boolean);
+  const unknown = slugs.filter((s) => !catalog.has(s));
+  if (unknown.length) throw new Error(`no such page: ${unknown.join(", ")}`);
+
+  const status = await withClient(pool, (c) => compileStatus(c));
+  let runId = 0;
+  if (!opts.dryRun) {
+    const started = await withClient(pool, (c) =>
+      c.queryObject<{ id: bigint }>(
+        `INSERT INTO wiki_compile_runs (model, from_thought_id, to_thought_id, unassigned)
+         SELECT $1, $2, $2, COALESCE((SELECT unassigned FROM wiki_compile_runs WHERE status IN ('ok', 'partial') ORDER BY id DESC LIMIT 1), '{}')
+         RETURNING id`,
+        [opts.model, status.high_water_mark],
+      )
+    );
+    runId = Number(started.rows[0].id);
+  }
+  const run: Run = { id: runId, model: opts.model, thoughts: new Map(), catalog, linkable: new Set(catalog.keys()) };
+  const done: string[] = [];
+  const failed: string[] = [];
+  await runPool(slugs, opts.concurrency, async (slug) => {
+    try {
+      await rebuildPage(slug, run, opts.dryRun);
+      done.push(slug);
+      log(`rebuilt ${slug}`);
+    } catch (err) {
+      failed.push(slug);
+      log(`FAILED ${slug}: ${(err as Error).message}`);
+    }
+  });
+  if (opts.dryRun) return;
+
+  const findings = await lint().catch((err) => [`Lint failed: ${(err as Error).message}.`]);
+  const summary = [
+    `Rebuilt ${done.length} page(s) from their sources${failed.length ? `; ${failed.length} failed (${failed.join(", ")})` : ""}.`,
+    ...findings,
+    `Usage: ${usageLine()}.`,
+  ].join(" ");
+  await withClient(pool, (c) =>
+    c.queryObject(
+      "UPDATE wiki_compile_runs SET status = $2, finished_at = now(), pages_updated = $3, summary = $4 WHERE id = $1",
+      [runId, failed.length ? "partial" : "ok", done.length, summary],
+    )
+  );
+  log(`rebuild #${runId} ${failed.length ? "partial" : "ok"}: ${summary}`);
+}
+
 async function runPool<T>(items: T[], concurrency: number, fn: (item: T) => Promise<void>): Promise<void> {
   const queue = [...items];
   const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
@@ -497,7 +611,7 @@ async function lint(): Promise<string[]> {
       [DUPLICATE_SIMILARITY],
     );
     if (dupes.rows.length) {
-      findings.push(`Possible duplicates: ${dupes.rows.map((r) => `[[${r.a}]] and [[${r.b}]] (${r.similarity.toFixed(2)})`).join(", ")}.`);
+      findings.push(`Possible duplicates: ${dupes.rows.map((r) => `[[${r.a}]] and [[${r.b}]] (${Number(r.similarity).toFixed(2)})`).join(", ")}.`);
     }
     const broken = await c.queryObject<{ slug: string; link: string }>(
       `SELECT p.slug, l AS link FROM wiki_pages p, unnest(p.links) AS l
@@ -627,7 +741,7 @@ async function compile(opts: Options): Promise<void> {
       }
     });
 
-    const findings = await lint();
+    const findings = await lint().catch((err) => [`Lint failed: ${(err as Error).message}.`]);
     // A thought left unassigned by two runs in a row is given up, so it cannot pin the mark forever.
     const givenUp = routing.unassigned.filter((id) => unassignedBefore.has(id));
     const unassigned = routing.unassigned.filter((id) => !unassignedBefore.has(id));
@@ -729,7 +843,8 @@ async function main(): Promise<void> {
       return;
     }
     try {
-      await compile(opts);
+      if (opts.rebuild) await rebuild(opts.rebuild, opts);
+      else await compile(opts);
     } finally {
       await lock.queryObject("SELECT pg_advisory_unlock($1)", [COMPILE_LOCK]).catch(() => {});
     }

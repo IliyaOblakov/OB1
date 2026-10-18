@@ -454,6 +454,31 @@ Deno.test({
         assertStringIncludes(await ok("wiki_read", { slug: "test-page" }), "sources (1 thoughts): #2");
       });
 
+      await t.step("rebuild rewrites pages from their sources and lint reports duplicates", async () => {
+        for (const slug of ["dupe-a", "dupe-b"]) {
+          await ok("wiki_write", { slug, title: "Duplicate page", body: "Same words on both pages." });
+        }
+        const preview = await compile("--rebuild", "hotel-sofia", "--dry-run");
+        assertStringIncludes(preview, "===== hotel-sofia =====");
+        assertStringIncludes(await ok("wiki_read", { slug: "hotel-sofia" }), "revision 2 |", "dry run must not write");
+
+        const out = await compile("--rebuild", "hotel-sofia");
+        assertStringIncludes(out, "rebuilt hotel-sofia");
+        assertStringIncludes(out, "Possible duplicates: [[dupe-a]] and [[dupe-b]] (1.00)");
+        assertStringIncludes(out, "rebuild #4 ok: Rebuilt 1 page(s) from their sources.");
+        assertStringIncludes(await ok("wiki_read", { slug: "hotel-sofia" }), "revision 3 |");
+        assertMatch(await ok("wiki_read", { slug: "log" }), /compile #4 ok \(gpt-5\.4-mini\): no new thoughts\. Updated \[\[hotel-sofia\]\]\. Rebuilt 1 page/);
+        assertStringIncludes(await ok("wiki_index"), "thoughts up to #5");
+        assertMatch((await call("wiki_write", { slug: "x" })).text, /title and body are required/);
+        const missing = await new Deno.Command(Deno.execPath(), {
+          args: ["run", "--no-lock", "--allow-net", "--allow-env", "--allow-read", "wiki_compile.ts", "--rebuild", "no-such-page"],
+          cwd: dir,
+          env,
+        }).output();
+        assertEquals(missing.code, 1);
+        assertStringIncludes(new TextDecoder().decode(missing.stderr), "no such page: no-such-page");
+      });
+
       await t.step("unassigned thoughts stay pending; pages without embeddings get one later", async () => {
         fake.failEmbeddings = true;
         try {
@@ -466,23 +491,23 @@ Deno.test({
         const partial = await compile();
         assertStringIncludes(partial, "re-embedded 1 page(s)");
         assertStringIncludes(partial, "Not assigned (retried next run): #6.");
-        assertStringIncludes(partial, "compile #4 partial");
+        assertStringIncludes(partial, "compile #5 partial");
         assertStringIncludes(await ok("wiki_index"), "thoughts up to #5");
         assertStringIncludes(await ok("wiki_read", { slug: "pending" }), "## [#6] ");
 
         fake.dropOrphans = false;
         const recovered = await compile();
         assertStringIncludes(recovered, "updated hotel-sofia");
-        assertStringIncludes(recovered, "compile #5 ok");
+        assertStringIncludes(recovered, "compile #6 ok");
         assertStringIncludes(await ok("wiki_read", { slug: "pending" }), "0 thought(s) after the last compile (#6)");
 
         await ok("capture_thought", { content: "Orphan note two: Hotel Sofia never gets routed." });
         fake.dropOrphans = true;
         try {
-          assertStringIncludes(await compile(), "compile #6 partial");
+          assertStringIncludes(await compile(), "compile #7 partial");
           const givenUp = await compile();
           assertStringIncludes(givenUp, "Not assigned twice, given up: #7.");
-          assertStringIncludes(givenUp, "compile #7 ok");
+          assertStringIncludes(givenUp, "compile #8 ok");
         } finally {
           fake.dropOrphans = false;
         }

@@ -197,6 +197,7 @@ The server also sends MCP `instructions` telling clients when to use the wiki an
 deno run --allow-net --allow-env --allow-read wiki_compile.ts --dry-run   # plan only
 deno run --allow-net --allow-env --allow-read wiki_compile.ts             # compile
 deno run --allow-net --allow-env --allow-read wiki_compile.ts --status
+deno run --allow-net --allow-env --allow-read wiki_compile.ts --rebuild all   # rewrite pages from all their sources
 deno run --allow-net --allow-env --allow-read --allow-write=/tmp/wiki wiki_compile.ts --export /tmp/wiki
 ```
 

@@ -622,7 +622,7 @@ export async function searchPages(
          ORDER BY embedding <=> $1::vector LIMIT $2`,
         [vector, depth],
       );
-      meaning = semantic.rows.filter((r) => r.similarity >= SEMANTIC_FLOOR).map((r) => r.slug);
+      meaning = semantic.rows.filter((r) => Number(r.similarity) >= SEMANTIC_FLOOR).map((r) => r.slug);
     }
 
     const lists = { text: text.rows.map((r) => r.slug), name: names.rows.map((r) => r.slug), meaning };
@@ -704,7 +704,9 @@ export async function renderLog(client: PoolClient, limit = 50): Promise<string>
     const pages = touched.filter((t) => Number(t.run_id) === Number(run.id));
     const created = pages.filter((p) => p.first_revision === 1).map((p) => `[[${p.slug}]]`);
     const updated = pages.filter((p) => p.first_revision > 1).map((p) => `[[${p.slug}]]`);
-    const range = run.to_thought_id !== null
+    const range = !run.thoughts_seen
+      ? " no new thoughts"
+      : run.to_thought_id !== null
       ? ` thoughts #${Number(run.from_thought_id) + 1}-#${Number(run.to_thought_id)} (${run.thoughts_seen} read)`
       : ` from thought #${Number(run.from_thought_id) + 1}`;
     const parts = [`compile #${Number(run.id)} ${run.status}${run.model ? ` (${run.model})` : ""}:${range}.`];
