@@ -40,6 +40,9 @@ const ROUTE_BATCH = 60;
 const ROUTE_EXCERPT_CHARS = 500;
 const CHUNK_CHARS = 160_000;
 const DUPLICATE_SIMILARITY = 0.9;
+const RELATED_LIMIT = 20;
+const relatedFloor = Number(env("WIKI_COMPILE_RELATED_FLOOR", "0.6"));
+const RELATED_FLOOR = Number.isFinite(relatedFloor) ? relatedFloor : 0.6;
 // Thoughts younger than this are left for the next run, so a capture still committing is never skipped.
 const settle = Number(env("WIKI_COMPILE_SETTLE_SECONDS", "60"));
 const SETTLE_SECONDS = Number.isFinite(settle) && settle >= 0 ? settle : 60;
@@ -97,6 +100,7 @@ type Run = {
   thoughts: Map<number, Thought>;
   catalog: Map<string, Entry>;
   linkable: Set<string>;
+  maxThoughtId: number;
 };
 
 const usage = { calls: 0, prompt: 0, completion: 0, reasoning: 0 };
@@ -243,7 +247,11 @@ Content rules:
 - Newer information wins. "SUPERSEDES earlier notes on X" replaces the older claims it names: update the fact, do not list both versions. "RETRACTED" means remove the content it names.
 - End every factual bullet or sentence with citations of the thoughts it comes from, like [#123] or [#123][#140]. Keep the citations of facts you keep. Cite only ids you were given.
 - Write dates as YYYY-MM-DD (add a time only when it matters). Keep exact names, paths, URLs, versions, numbers and amounts. Keep commit hashes, session ids and file hashes only when someone will need them later (the current main commit, a live deployment), not for superseded intermediate steps. Never include secrets (keys, passwords, tokens), even if a thought contains one.
-- Refer to the owner as Iliya (the notes often say "the user").
+- Iliya is the person these notes belong to; the notes often call him "the user". In client projects "the owner" usually means the client's owner, not Iliya: keep them apart.
+- Date history entries by when the event happened (the note's "As of" time or a date in its text), not by when a later note mentions it.
+- Sub-pages hold the detail and status of their areas: for an area that has a sub-page, keep one summary line with its [[slug]] link and do not repeat its status.
+- Thoughts marked "related" were filed under other pages: use them to correct or complete facts about this page's subject (the newest wins) and cite them when you use them.
+- Before answering, check each Current state and Open items line against the newest thought on that point, own or related. If a later thought says it changed, was done or was fixed, update or remove the line.
 - Link other wiki pages as [[slug]], only with slugs from the list, where the text mentions that subject. Do not link the page to itself.
 - Keep every durable fact already on the page unless a newer thought supersedes or retracts it: new thoughts add to the page, they do not replace it. Durable means it still matters next month: what the subject is, where it lives (paths, URLs, servers, repositories), who is involved, prices and terms, decisions, rules and milestones.
 - Drop intermediate statuses that later notes made obsolete (a PR that was opened and later merged needs only the merge).
@@ -292,7 +300,7 @@ function writePrompt(
   page: PageText | null,
   part: Thought[],
   run: Run,
-  opts: { total?: number; rebuild?: boolean } = {},
+  opts: { total?: number; rebuild?: boolean; related?: Thought[] } = {},
 ): string {
   const others = new Map([...run.catalog].filter(([s]) => s !== slug && run.linkable.has(s)));
   const lines = [
@@ -318,9 +326,20 @@ function writePrompt(
     lines.push(`New page. Proposed title: ${entry.title}. Proposed summary: ${entry.summary}`);
   }
   lines.push("", "Other wiki pages (slug | title):", catalogLines(others, false), "");
-  lines.push(`Thoughts for this page (${part.length}, oldest first):`);
-  for (const t of part) {
-    lines.push("", `=== [#${t.id}] captured ${stamp(t.created_at)} ===`, t.content.trim());
+  const children = [...run.catalog.values()].filter((e) =>
+    e.slug.startsWith(`${slug}-`) && ![...run.catalog.keys()].some((o) => o !== e.slug && o.startsWith(`${slug}-`) && e.slug.startsWith(`${o}-`))
+  );
+  if (children.length) {
+    lines.push("Sub-pages of this page (slug | title | summary):", ...children.map((e) => `${e.slug} | ${e.title} | ${e.summary}`), "");
+  }
+  const related = new Set((opts.related ?? []).map((t) => t.id));
+  const stream = [...part, ...(opts.related ?? [])].sort((a, b) => a.id - b.id);
+  lines.push(
+    `Thoughts (${part.length} for this page${related.size ? `, ${related.size} related ones filed under other pages` : ""}), oldest first:`,
+  );
+  for (const t of stream) {
+    const label = related.has(t.id) ? " (related: filed under another page)" : "";
+    lines.push("", `=== [#${t.id}] captured ${stamp(t.created_at)}${label} ===`, t.content.trim());
   }
   return lines.join("\n");
 }
@@ -456,6 +475,22 @@ function chunkByChars(thoughts: Thought[], budget: number): Thought[][] {
   return chunks;
 }
 
+async function relatedThoughts(slug: string, exclude: number[], maxId: number): Promise<Thought[]> {
+  const result = await withClient(pool, (c) =>
+    c.queryObject<{ id: bigint; content: string; metadata: Record<string, unknown> | null; created_at: Date; similarity: unknown }>(
+      `SELECT t.id, t.content, t.metadata, t.created_at, 1 - (t.embedding <=> p.embedding) AS similarity
+       FROM thoughts t JOIN wiki_pages p ON p.slug = $1
+       WHERE p.embedding IS NOT NULL AND t.embedding IS NOT NULL AND t.id <= $3 AND NOT (t.id = ANY($2::bigint[]))
+       ORDER BY t.embedding <=> p.embedding LIMIT $4`,
+      [slug, exclude, maxId, RELATED_LIMIT],
+    )
+  );
+  return result.rows
+    .filter((r) => Number(r.similarity) >= RELATED_FLOOR)
+    .map((r) => ({ id: Number(r.id), content: r.content, metadata: r.metadata ?? {}, created_at: r.created_at }))
+    .sort((a, b) => a.id - b.id);
+}
+
 async function compilePage(slug: string, ids: number[], run: Run): Promise<"created" | "updated" | "skipped"> {
   const entry = run.catalog.get(slug)!;
   let page = await withClient(pool, (c) => getPage(c, slug));
@@ -463,16 +498,17 @@ async function compilePage(slug: string, ids: number[], run: Run): Promise<"crea
   const known = new Set(page?.sources ?? []);
   const todo = ids.filter((id) => !known.has(id)).sort((a, b) => a - b).map((id) => run.thoughts.get(id)!);
   if (!todo.length) return "skipped";
+  const related = await relatedThoughts(slug, [...known, ...ids], run.maxThoughtId);
 
   for (const part of chunkByChars(todo, CHUNK_CHARS)) {
     for (let attempt = 1;; attempt++) {
       try {
-        const raw = await chatJSON<Partial<Draft>>(run.model, "medium", WRITE_SYSTEM, writePrompt(slug, entry, page, part, run));
+        const raw = await chatJSON<Partial<Draft>>(run.model, "medium", WRITE_SYSTEM, writePrompt(slug, entry, page, part, run, { related }));
         const draft = cleanDraft(raw, {
           slug,
           category: entry.category,
           fallbackTitle: page?.title ?? entry.title,
-          allowedIds: new Set([...(page?.sources ?? []), ...part.map((t) => t.id)]),
+          allowedIds: new Set([...(page?.sources ?? []), ...part.map((t) => t.id), ...related.map((t) => t.id)]),
           linkable: run.linkable,
         });
         const result = await writePage(pool, getEmbedding, {
@@ -512,19 +548,20 @@ async function rebuildPage(slug: string, run: Run, dryRun: boolean): Promise<voi
   const page = (await withClient(pool, (c) => getPage(c, slug)))!;
   const entry = run.catalog.get(slug)!;
   const thoughts = await loadThoughtsById(page.sources);
+  const related = await relatedThoughts(slug, page.sources, run.maxThoughtId);
   let current: PageText = page;
   for (const part of chunkByChars(thoughts, CHUNK_CHARS)) {
     const raw = await chatJSON<Partial<Draft>>(
       run.model,
       "medium",
       WRITE_SYSTEM,
-      writePrompt(slug, entry, current, part, run, { total: thoughts.length, rebuild: current === page }),
+      writePrompt(slug, entry, current, part, run, { total: thoughts.length, rebuild: current === page, related }),
     );
     current = cleanDraft(raw, {
       slug,
       category: entry.category,
       fallbackTitle: page.title,
-      allowedIds: new Set(page.sources),
+      allowedIds: new Set([...page.sources, ...related.map((t) => t.id)]),
       linkable: run.linkable,
     });
   }
@@ -561,7 +598,14 @@ async function rebuild(target: string, opts: Options): Promise<void> {
     );
     runId = Number(started.rows[0].id);
   }
-  const run: Run = { id: runId, model: opts.model, thoughts: new Map(), catalog, linkable: new Set(catalog.keys()) };
+  const run: Run = {
+    id: runId,
+    model: opts.model,
+    thoughts: new Map(),
+    catalog,
+    linkable: new Set(catalog.keys()),
+    maxThoughtId: status.high_water_mark,
+  };
   const done: string[] = [];
   const failed: string[] = [];
   await runPool(slugs, opts.concurrency, async (slug) => {
@@ -724,6 +768,7 @@ async function compile(opts: Options): Promise<void> {
       thoughts: new Map(thoughts.map((t) => [t.id, t])),
       catalog,
       linkable: new Set([...catalog.values()].filter((e) => !e.proposed || routing.assignments.has(e.slug)).map((e) => e.slug)),
+      maxThoughtId: last,
     };
     const created: string[] = [];
     const updated: string[] = [];

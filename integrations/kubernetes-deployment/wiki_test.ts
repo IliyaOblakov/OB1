@@ -106,7 +106,7 @@ Deno.test("renderIndex groups pages by category and reports pending thoughts", (
 const DB_HOST = Deno.env.get("WIKI_TEST_DB_HOST");
 const ACCESS_KEY = "test-access-key";
 
-const fake = { failEmbeddings: false, breakWriter: false, dropOrphans: false };
+const fake = { failEmbeddings: false, breakWriter: false, dropOrphans: false, writePrompts: [] as string[] };
 
 function fakeEmbedding(text: string): number[] {
   const v = new Array(1536).fill(0);
@@ -140,9 +140,10 @@ function fakeChat(system: string, user: string): Record<string, unknown> {
     return { new_pages: [], assignments };
   }
   if (system.includes("compile one page")) {
+    fake.writePrompts.push(user);
     const slug = user.match(/^Page slug: (\S+)/)?.[1];
     if (slug === "broken-subject" && fake.breakWriter) return { title: "Broken", summary: "", tags: [], body: "" };
-    const ids = [...user.matchAll(/=== \[#(\d+)\]/g)].map((m) => m[1]);
+    const ids = [...user.matchAll(/=== \[#(\d+)\] captured [^\n]*UTC ===/g)].map((m) => m[1]);
     const current = user.match(/Current body:\n<<<\n([\s\S]*?)\n>>>/)?.[1];
     const facts = ids.map((id) => `- Fact from thought ${id} [#${id}]`).join("\n");
     const body = current
@@ -214,7 +215,7 @@ Deno.test({
       const out = await new Deno.Command(Deno.execPath(), {
         args: ["run", "--no-lock", "--allow-net", "--allow-env", "--allow-read", "--allow-write=/tmp", "wiki_compile.ts", ...args],
         cwd: dir,
-        env: { ...env, WIKI_COMPILE_MODEL: "gpt-5.4-mini", WIKI_COMPILE_SETTLE_SECONDS: "0" },
+        env: { ...env, WIKI_COMPILE_MODEL: "gpt-5.4-mini", WIKI_COMPILE_SETTLE_SECONDS: "0", WIKI_COMPILE_RELATED_FLOOR: "-1" },
       }).output();
       const text = new TextDecoder().decode(out.stdout) + new TextDecoder().decode(out.stderr);
       assertEquals(out.code, 0, text);
@@ -462,8 +463,12 @@ Deno.test({
         assertStringIncludes(preview, "===== hotel-sofia =====");
         assertStringIncludes(await ok("wiki_read", { slug: "hotel-sofia" }), "revision 2 |", "dry run must not write");
 
+        fake.writePrompts = [];
         const out = await compile("--rebuild", "hotel-sofia");
         assertStringIncludes(out, "rebuilt hotel-sofia");
+        assertMatch(fake.writePrompts[0], /=== \[#5\] captured [^\n]* \(related: filed under another page\) ===/);
+        assertMatch(fake.writePrompts[0], /=== \[#1\] captured [^\n]*UTC ===/);
+        assert(!/\[#1\] captured [^\n]*related/.test(fake.writePrompts[0]), "own sources are not marked related");
         assertStringIncludes(out, "Possible duplicates: [[dupe-a]] and [[dupe-b]] (1.00)");
         assertStringIncludes(out, "rebuild #4 ok: Rebuilt 1 page(s) from their sources.");
         assertStringIncludes(await ok("wiki_read", { slug: "hotel-sofia" }), "revision 3 |");
@@ -523,6 +528,11 @@ Deno.test({
           "parent: [[hotel-sofia]] | sub-pages: [[hotel-sofia-spa-sauna]]",
         );
         assert(!(await ok("wiki_read", { slug: "test-page" })).includes("sub-pages:"), "unrelated pages get no family line");
+        fake.writePrompts = [];
+        await compile("--rebuild", "hotel-sofia", "--dry-run");
+        assertStringIncludes(fake.writePrompts[0], "Sub-pages of this page (slug | title | summary):\nhotel-sofia-spa | Hotel Sofia spa |");
+        const subPages = fake.writePrompts[0].split("Sub-pages of this page")[1].split("\n\n")[0];
+        assert(!subPages.includes("hotel-sofia-spa-sauna"), "only direct sub-pages are listed");
       });
     } finally {
       server.kill("SIGTERM");
