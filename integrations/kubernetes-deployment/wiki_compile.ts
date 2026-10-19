@@ -532,7 +532,7 @@ async function draftUpdate(
     if (lost.length < Math.max(DROP_LIMIT, Math.ceil(extractCitations(page.body).length / 4))) return draft;
     if (attempt === 2) {
       throw new Error(
-        `the update dropped ${lost.length} cited thoughts twice; page left unchanged. Fold its pending thoughts in by hand with wiki_write (COMPILE_PROMPT.md step 3); once the page cites them, the next run moves on`,
+        `the update dropped ${lost.length} cited thoughts twice; page left unchanged. Fold its pending thoughts in by hand with wiki_write; once the page cites them, the next run moves on`,
       );
     }
     log(`${slug}: update dropped ${lost.length} cited thoughts; asking again`);
