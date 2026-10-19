@@ -9,6 +9,7 @@ import {
   compileStatus,
   embedMissing,
   ensureWikiSchema,
+  extractCitations,
   getPage,
   LINK_PATTERN,
   listPages,
@@ -40,6 +41,12 @@ const ROUTE_BATCH = 60;
 const ROUTE_EXCERPT_CHARS = 500;
 const CHUNK_CHARS = 160_000;
 const DUPLICATE_SIMILARITY = 0.9;
+// An update may drop fewer than max(this, a quarter of the page's cited thoughts) citations.
+const DROP_LIMIT = 4;
+// Pointer pages left by a merge carry this tag: they take no new thoughts and are not linked, rebuilt or linted.
+const MERGED_TAG = "merged";
+// Exit status when a page failed: the systemd unit then fails, which the sites-1 watchdog reports.
+const FAILED_PAGES_EXIT = 3;
 const RELATED_LIMIT = 20;
 const relatedFloor = Number(env("WIKI_COMPILE_RELATED_FLOOR", "0.6"));
 const RELATED_FLOOR = Number.isFinite(relatedFloor) ? relatedFloor : 0.6;
@@ -59,7 +66,10 @@ Options:
   --status            print the compile status and exit
   --rebuild SLUGS     rewrite pages from all their sources: comma-separated slugs or "all" (--dry-run prints them)
   --export DIR        write every page plus index.md and log.md to DIR (needs --allow-write=DIR)
-  --help              show this text`;
+  --help              show this text
+
+Pages tagged "merged" (pointers left after a merge) take no new thoughts and are not linked or rebuilt.
+Exit status: 0 done, 1 error, 3 some pages failed (their thoughts stay pending for the next run).`;
 
 const pool = new Pool({
   hostname: env("DB_HOST", "127.0.0.1"),
@@ -244,11 +254,13 @@ const WRITE_SYSTEM = `You compile one page of the Open Brain wiki, a markdown kn
 
 Content rules:
 - Use only facts stated in the current page or in the thoughts, and only the parts of a thought that concern this page's subject. No speculation, filler or advice.
-- Newer information wins. "SUPERSEDES earlier notes on X" replaces the older claims it names: update the fact, do not list both versions. "RETRACTED" means remove the content it names.
+- Unless the request says it is a rebuild, the current page was already checked against its sources: edit it, do not rewrite it. Add the new facts, change only the lines that a new thought updates, supersedes or retracts, add History entries, and copy every other line exactly as it is, with its citations.
+- Newer information wins. "SUPERSEDES earlier notes on X" replaces the older claims it names: update the fact, do not present both versions as current. When the old value still matters to a reader (a price, a fee, a date, a reversed decision), keep it once, marked, for example "79 EUR a month (an earlier note said 80 EUR) [#526]". "RETRACTED" means remove the content it names.
 - End every factual bullet or sentence with citations of the thoughts it comes from, like [#123] or [#123][#140]. Keep the citations of facts you keep. Cite only ids you were given.
 - Write dates as YYYY-MM-DD (add a time only when it matters). Keep exact names, paths, URLs, versions, numbers and amounts. Keep commit hashes, session ids and file hashes only when someone will need them later (the current main commit, a live deployment), not for superseded intermediate steps. Never include secrets (keys, passwords, tokens), even if a thought contains one.
-- Iliya is the person these notes belong to; the notes often call him "the user". In client projects "the owner" usually means the client's owner, not Iliya: keep them apart.
-- Date history entries by when the event happened (the note's "As of" time or a date in its text), not by when a later note mentions it.
+- Iliya is the person these notes belong to. Notes often say "the user": write "Iliya" only where the note names him or it is certain, otherwise keep "the user". In client projects "the owner" and "the client" mean the client's owner, never Iliya. Keep who decided, who asked and who did what exactly as the note says.
+- Date history entries by when the event happened (the note's "As of" time or a date in its text, Sofia time), not by when a later note mentions it.
+- Collapse a chain of status notes (PR numbers, commit heads, render stages, review rounds) into the current state plus one History line per milestone.
 - Sub-pages hold the detail and status of their areas: for an area that has a sub-page, keep one summary line with its [[slug]] link and do not repeat its status.
 - Thoughts marked "related" were filed under other pages: use them to correct or complete facts about this page's subject (the newest wins) and cite them when you use them.
 - Before answering, check each Current state and Open items line against the newest thought on that point, own or related. If a later thought says it changed, was done or was fixed, update or remove the line.
@@ -496,6 +508,34 @@ async function relatedThoughts(slug: string, exclude: number[], maxId: number): 
     .sort((a, b) => a.id - b.id);
 }
 
+function droppedCitations(before: string, after: string): number[] {
+  const kept = new Set(extractCitations(after));
+  return extractCitations(before).filter((id) => !kept.has(id));
+}
+
+async function draftUpdate(
+  slug: string,
+  entry: Entry,
+  page: WikiPage | null,
+  part: Thought[],
+  run: Run,
+  related: Thought[],
+): Promise<Draft> {
+  const allowedIds = new Set([...(page?.sources ?? []), ...part.map((t) => t.id), ...related.map((t) => t.id)]);
+  let prompt = writePrompt(slug, entry, page, part, run, { related });
+  for (let attempt = 1;; attempt++) {
+    const raw = await chatJSON<Partial<Draft>>(run.model, "medium", WRITE_SYSTEM, prompt);
+    const draft = cleanDraft(raw, { slug, category: entry.category, fallbackTitle: page?.title ?? entry.title, allowedIds, linkable: run.linkable });
+    if (!page) return draft;
+    // A routine update must not quietly drop facts a checked page already cites: retry once, then leave the page alone.
+    const lost = droppedCitations(page.body, draft.body);
+    if (lost.length < Math.max(DROP_LIMIT, Math.ceil(extractCitations(page.body).length / 4))) return draft;
+    if (attempt === 2) throw new Error(`the update dropped ${lost.length} cited thoughts twice; page left unchanged`);
+    log(`${slug}: update dropped ${lost.length} cited thoughts; asking again`);
+    prompt += `\n\nYour previous answer removed the facts cited as ${lost.map((id) => `[#${id}]`).join("")}. Return the complete page again and keep those facts unless a thought above supersedes or retracts them.`;
+  }
+}
+
 async function compilePage(slug: string, ids: number[], run: Run): Promise<"created" | "updated" | "skipped"> {
   const entry = run.catalog.get(slug)!;
   let page = await withClient(pool, (c) => getPage(c, slug));
@@ -508,14 +548,7 @@ async function compilePage(slug: string, ids: number[], run: Run): Promise<"crea
   for (const part of chunkByChars(todo, CHUNK_CHARS)) {
     for (let attempt = 1;; attempt++) {
       try {
-        const raw = await chatJSON<Partial<Draft>>(run.model, "medium", WRITE_SYSTEM, writePrompt(slug, entry, page, part, run, { related }));
-        const draft = cleanDraft(raw, {
-          slug,
-          category: entry.category,
-          fallbackTitle: page?.title ?? entry.title,
-          allowedIds: new Set([...(page?.sources ?? []), ...part.map((t) => t.id), ...related.map((t) => t.id)]),
-          linkable: run.linkable,
-        });
+        const draft = await draftUpdate(slug, entry, page, part, run, related);
         const result = await writePage(pool, getEmbedding, {
           slug,
           ...draft,
@@ -584,7 +617,7 @@ async function rebuildPage(slug: string, run: Run, dryRun: boolean): Promise<voi
   });
 }
 
-async function rebuild(target: string, opts: Options): Promise<void> {
+async function rebuild(target: string, opts: Options): Promise<number> {
   const catalog = await loadCatalog();
   const slugs = target === "all" ? [...catalog.keys()] : target.split(",").map((s) => s.trim()).filter(Boolean);
   const unknown = slugs.filter((s) => !catalog.has(s));
@@ -623,7 +656,7 @@ async function rebuild(target: string, opts: Options): Promise<void> {
       log(`FAILED ${slug}: ${(err as Error).message}`);
     }
   });
-  if (opts.dryRun) return;
+  if (opts.dryRun) return failed.length;
 
   const findings = await lint().catch((err) => [`Lint failed: ${(err as Error).message}.`]);
   const summary = [
@@ -638,6 +671,7 @@ async function rebuild(target: string, opts: Options): Promise<void> {
     )
   );
   log(`rebuild #${runId} ${failed.length ? "partial" : "ok"}: ${summary}`);
+  return failed.length;
 }
 
 async function runPool<T>(items: T[], concurrency: number, fn: (item: T) => Promise<void>): Promise<void> {
@@ -655,9 +689,10 @@ async function lint(): Promise<string[]> {
       `SELECT a.slug AS a, b.slug AS b, 1 - (a.embedding <=> b.embedding) AS similarity
        FROM wiki_pages a JOIN wiki_pages b ON a.slug < b.slug
        WHERE a.embedding IS NOT NULL AND b.embedding IS NOT NULL
+         AND NOT ($2 = ANY(a.tags)) AND NOT ($2 = ANY(b.tags))
          AND 1 - (a.embedding <=> b.embedding) >= $1
        ORDER BY similarity DESC LIMIT 10`,
-      [DUPLICATE_SIMILARITY],
+      [DUPLICATE_SIMILARITY, MERGED_TAG],
     );
     if (dupes.rows.length) {
       findings.push(`Possible duplicates: ${dupes.rows.map((r) => `[[${r.a}]] and [[${r.b}]] (${Number(r.similarity).toFixed(2)})`).join(", ")}.`);
@@ -672,9 +707,11 @@ async function lint(): Promise<string[]> {
     }
     const orphans = await c.queryObject<{ slug: string }>(
       `SELECT p.slug FROM wiki_pages p
-       WHERE NOT EXISTS (SELECT 1 FROM wiki_pages q WHERE q.slug <> p.slug AND q.links @> ARRAY[p.slug])
+       WHERE NOT ($1 = ANY(p.tags))
+         AND NOT EXISTS (SELECT 1 FROM wiki_pages q WHERE q.slug <> p.slug AND q.links @> ARRAY[p.slug])
          AND NOT EXISTS (SELECT 1 FROM wiki_pages q WHERE p.slug LIKE q.slug || '-%')
        ORDER BY 1 LIMIT 30`,
+      [MERGED_TAG],
     );
     if (orphans.rows.length) {
       findings.push(`Top-level pages no other page links to: ${orphans.rows.map((r) => `[[${r.slug}]]`).join(", ")}.`);
@@ -697,7 +734,7 @@ async function loadThoughts(after: number, limit: number): Promise<Thought[]> {
 
 async function loadCatalog(): Promise<Map<string, Entry>> {
   const pages = await withClient(pool, (c) => listPages(c));
-  return new Map(pages.map((p) => [p.slug, {
+  return new Map(pages.filter((p) => !p.tags.includes(MERGED_TAG)).map((p) => [p.slug, {
     slug: p.slug,
     title: p.title,
     category: p.tags.find((t) => (CATEGORIES as readonly string[]).includes(t)) ?? "topic",
@@ -711,7 +748,7 @@ function usageLine(): string {
   return `${usage.calls} model call(s), ${usage.prompt} prompt + ${usage.completion} completion tokens (${usage.reasoning} reasoning)`;
 }
 
-async function compile(opts: Options): Promise<void> {
+async function compile(opts: Options): Promise<number> {
   await withClient(pool, (c) =>
     c.queryArray(
       "UPDATE wiki_compile_runs SET status = 'failed', finished_at = now(), error = 'abandoned: the process ended before finishing' WHERE status = 'running'",
@@ -723,7 +760,7 @@ async function compile(opts: Options): Promise<void> {
   const thoughts = await loadThoughts(status.high_water_mark, opts.limit);
   if (!thoughts.length) {
     log(`No new thoughts since the last compile (high-water mark #${status.high_water_mark}).`);
-    return;
+    return 0;
   }
   const first = thoughts[0].id;
   const last = thoughts[thoughts.length - 1].id;
@@ -764,7 +801,7 @@ async function compile(opts: Options): Promise<void> {
       console.log(`noise: ${routing.noise.map((id) => `#${id}`).join(", ") || "none"}`);
       console.log(`unassigned: ${routing.unassigned.map((id) => `#${id}`).join(", ") || "none"}`);
       console.log(usageLine());
-      return;
+      return 0;
     }
 
     const run: Run = {
@@ -816,6 +853,7 @@ async function compile(opts: Options): Promise<void> {
       )
     );
     log(`compile #${runId} ${outcome}: ${summary}`);
+    return failed.length;
   } catch (err) {
     if (runId) {
       await withClient(pool, (c) =>
@@ -873,29 +911,35 @@ async function exportWiki(dir: string): Promise<void> {
   log(`exported ${pages.length} page(s) plus index.md and log.md to ${dir}`);
 }
 
-async function main(): Promise<void> {
+async function main(): Promise<number> {
   const opts = parseOptions(Deno.args);
   if (opts.help) {
     console.log(USAGE);
-    return;
+    return 0;
   }
   await ensureWikiSchema(pool);
-  if (opts.status) return await printStatus();
-  if (opts.exportDir) return await exportWiki(opts.exportDir);
+  if (opts.status) {
+    await printStatus();
+    return 0;
+  }
+  if (opts.exportDir) {
+    await exportWiki(opts.exportDir);
+    return 0;
+  }
   if (!CHAT_API_KEY) {
     throw new Error("no chat API key configured (CHAT_API_KEY or EMBEDDING_API_KEY); compile by hand through the MCP tools instead (wiki_read 'pending', then wiki_write)");
   }
 
+  let failedPages = 0;
   const lock = await pool.connect();
   try {
     const got = await lock.queryObject<{ ok: boolean }>("SELECT pg_try_advisory_lock($1) AS ok", [COMPILE_LOCK]);
     if (!got.rows[0]?.ok) {
       log("another compile is running; nothing to do");
-      return;
+      return 0;
     }
     try {
-      if (opts.rebuild) await rebuild(opts.rebuild, opts);
-      else await compile(opts);
+      failedPages = opts.rebuild ? await rebuild(opts.rebuild, opts) : await compile(opts);
     } finally {
       await lock.queryObject("SELECT pg_advisory_unlock($1)", [COMPILE_LOCK]).catch(() => {});
     }
@@ -903,12 +947,14 @@ async function main(): Promise<void> {
     lock.release();
   }
   log(`done; ${usageLine()}`);
+  return failedPages ? FAILED_PAGES_EXIT : 0;
 }
 
 if (import.meta.main) {
   try {
-    await main();
+    const code = await main();
     await pool.end();
+    if (code) Deno.exit(code);
   } catch (err) {
     console.error(`wiki_compile: ${(err as Error).message}`);
     await pool.end().catch(() => {});

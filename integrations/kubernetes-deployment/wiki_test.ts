@@ -106,7 +106,14 @@ Deno.test("renderIndex groups pages by category and reports pending thoughts", (
 const DB_HOST = Deno.env.get("WIKI_TEST_DB_HOST");
 const ACCESS_KEY = "test-access-key";
 
-const fake = { failEmbeddings: false, breakWriter: false, dropOrphans: false, writePrompts: [] as string[] };
+const fake = {
+  failEmbeddings: false,
+  breakWriter: false,
+  dropOrphans: false,
+  dropOld: false,
+  writePrompts: [] as string[],
+  routePrompts: [] as string[],
+};
 
 function fakeEmbedding(text: string): number[] {
   const v = new Array(1536).fill(0);
@@ -131,6 +138,7 @@ function fakeChat(system: string, user: string): Record<string, unknown> {
     return { new_pages: pages };
   }
   if (system.includes("Assign every thought")) {
+    fake.routePrompts.push(user);
     const assignments = [...user.matchAll(/\[#(\d+)\] [^\n]*\n([^\n]*)/g)]
       .filter(([, , text]) => !(fake.dropOrphans && text.includes("Orphan")))
       .map(([, id, text]) => ({
@@ -147,7 +155,7 @@ function fakeChat(system: string, user: string): Record<string, unknown> {
     const current = user.match(/Current body:\n<<<\n([\s\S]*?)\n>>>/)?.[1];
     const facts = ids.map((id) => `- Fact from thought ${id} [#${id}]`).join("\n");
     const body = current
-      ? `${current}\n${facts}`
+      ? fake.dropOld ? facts : `${current}\n${facts}`
       : `# Should be stripped\n\nIntro sentence \u2014 with a dash. [#999999]\n\n## Current state\n${facts}\n\n## History\n- 2026-10-01 \u2013 opened for 10\u201312 guests\n\nSee [[test-page]] and [[no-such-page]].`;
     return { title: slug === "hotel-sofia" ? "Hotel Sofia" : "Broken subject", summary: `Summary of ${slug}`, tags: ["client", "Hotel"], body };
   }
@@ -211,16 +219,17 @@ Deno.test({
     }).spawn();
     const url = `http://127.0.0.1:${port}/`;
 
-    const compile = async (...args: string[]) => {
+    const compileExpecting = async (code: number, ...args: string[]) => {
       const out = await new Deno.Command(Deno.execPath(), {
         args: ["run", "--no-lock", "--allow-net", "--allow-env", "--allow-read", "--allow-write=/tmp", "wiki_compile.ts", ...args],
         cwd: dir,
         env: { ...env, WIKI_COMPILE_MODEL: "gpt-5.4-mini", WIKI_COMPILE_SETTLE_SECONDS: "0", WIKI_COMPILE_RELATED_FLOOR: "-1" },
       }).output();
       const text = new TextDecoder().decode(out.stdout) + new TextDecoder().decode(out.stderr);
-      assertEquals(out.code, 0, text);
+      assertEquals(out.code, code, text);
       return text;
     };
+    const compile = (...args: string[]) => compileExpecting(0, ...args);
 
     let seq = 0;
     const rpc = async (method: string, params: unknown = {}, key = ACCESS_KEY) => {
@@ -422,7 +431,7 @@ Deno.test({
         await ok("capture_thought", { content: "Hotel Sofia added a sauna in October." });
         await ok("capture_thought", { content: "Broken subject note for the failure test." });
         fake.breakWriter = true;
-        const partial = await compile("--concurrency", "1");
+        const partial = await compileExpecting(3, "--concurrency", "1");
         assertStringIncludes(partial, "updated hotel-sofia");
         assertStringIncludes(partial, "FAILED broken-subject");
         assertStringIncludes(partial, "compile #2 partial");
@@ -536,6 +545,41 @@ Deno.test({
         assertStringIncludes(fake.writePrompts[0], "Sub-pages of this page (slug | title | summary):\nhotel-sofia-spa | Hotel Sofia spa |");
         const subPages = fake.writePrompts[0].split("Sub-pages of this page")[1].split("\n\n")[0];
         assert(!subPages.includes("hotel-sofia-spa-sauna"), "only direct sub-pages are listed");
+      });
+
+      await t.step("merged pages take no thoughts; an update that drops cited facts is refused", async () => {
+        await ok("wiki_write", {
+          slug: "old-hotel-notes",
+          title: "Old hotel notes",
+          summary: "Merged into hotel-sofia.",
+          tags: ["topic", "merged"],
+          body: "This page was merged into [[hotel-sofia]] on 2026-10-19.",
+        });
+        const before = await ok("wiki_read", { slug: "hotel-sofia" });
+        const revision = before.match(/\| revision (\d+) \|/)![1];
+        await ok("capture_thought", { content: "Hotel Sofia opened a new spa wing." });
+
+        fake.dropOld = true;
+        fake.writePrompts = [];
+        fake.routePrompts = [];
+        try {
+          const refused = await compileExpecting(3);
+          assertStringIncludes(refused, "hotel-sofia: update dropped");
+          assertMatch(refused, /FAILED hotel-sofia: the update dropped \d+ cited thoughts twice; page left unchanged/);
+          assertStringIncludes(refused, "partial");
+        } finally {
+          fake.dropOld = false;
+        }
+        assertEquals(fake.writePrompts.length, 2);
+        assertStringIncludes(fake.writePrompts[1], "Your previous answer removed the facts cited as [#1]");
+        assert(!fake.routePrompts.some((p) => p.includes("old-hotel-notes")), "merged pages are not offered for routing");
+        assert(!fake.writePrompts[0].includes("old-hotel-notes"), "merged pages are not offered as links");
+        assertStringIncludes(await ok("wiki_read", { slug: "hotel-sofia" }), `| revision ${revision} |`);
+
+        const recovered = await compile();
+        assertStringIncludes(recovered, "updated hotel-sofia");
+        assert(!recovered.includes("[[old-hotel-notes]]"), "lint ignores merged pages");
+        assertStringIncludes(await ok("wiki_read", { slug: "hotel-sofia" }), "Fact from thought 1 [#1]");
       });
     } finally {
       server.kill("SIGTERM");
