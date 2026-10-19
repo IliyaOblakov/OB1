@@ -289,6 +289,9 @@ Deno.test({
           clientInfo: { name: "wiki-test", version: "1" },
         });
         assertStringIncludes(init.body.result.instructions, "wiki_index");
+        assertStringIncludes(init.body.result.instructions, "After search_thoughts, also read the subject's wiki page");
+        const searchThoughts = body.result.tools.find((tool: { name: string }) => tool.name === "search_thoughts");
+        assertStringIncludes(searchThoughts.description, "also read the subject's wiki page (wiki_search / wiki_read)");
       });
 
       const hotel1 = "As of 2026-10-01: Hotel Sofia in Bansko closes for the season from 2026-10-05.";
@@ -583,6 +586,39 @@ Deno.test({
         assert(!recovered.includes("Lint failed"), recovered);
         assert(!recovered.includes("[[old-hotel-notes]]"), "lint ignores merged pages");
         assertStringIncludes(await ok("wiki_read", { slug: "hotel-sofia" }), "Fact from thought 1 [#1]");
+      });
+
+      await t.step("merged pointer pages are hidden from index, list, search and page families, readable by slug", async () => {
+        const slug = "hotel-sofia-old-spa";
+        await ok("wiki_write", { slug, title: "Hotel Sofia old spa", summary: "Old spa notes.", tags: ["topic"], body: "Unique word quokkaharbor. See [[hotel-sofia]]." });
+        const views = async () => ({
+          index: await ok("wiki_index"),
+          list: await ok("wiki_list"),
+          textSearch: await ok("wiki_search", { query: "quokkaharbor" }),
+          nameSearch: await ok("wiki_search", { query: "hotel sofia old spa" }),
+          parentPage: await ok("wiki_read", { slug: "hotel-sofia" }),
+        });
+        for (const [view, text] of Object.entries(await views())) assertStringIncludes(text, slug, `${view} before the merge`);
+
+        await ok("wiki_write", {
+          slug,
+          summary: "Merged into hotel-sofia.",
+          tags: ["topic", "merged"],
+          body: "This page was merged into [[hotel-sofia]]. Unique word quokkaharbor.",
+        });
+        for (const [view, text] of Object.entries(await views())) assert(!text.includes(slug), `${view} still shows the merged page:\n${text}`);
+        assertStringIncludes(await ok("wiki_list", { tag: "merged" }), `- ${slug}: Hotel Sofia old spa. Merged into hotel-sofia.`);
+
+        const direct = await ok("wiki_read", { slug });
+        assertStringIncludes(direct, "tags: topic, merged");
+        assertStringIncludes(direct, "links: [[hotel-sofia]]");
+        assertStringIncludes(direct, "parent: [[hotel-sofia]]");
+        assertStringIncludes(direct, "This page was merged into [[hotel-sofia]].");
+
+        await compile("--export", "/tmp/wiki-export-merged");
+        assertStringIncludes(await Deno.readTextFile(`/tmp/wiki-export-merged/${slug}.md`), "tags: [\"topic\", \"merged\"]");
+        assert(!(await Deno.readTextFile("/tmp/wiki-export-merged/index.md")).includes(slug), "exported index hides merged pages");
+        await Deno.remove("/tmp/wiki-export-merged", { recursive: true });
       });
     } finally {
       server.kill("SIGTERM");

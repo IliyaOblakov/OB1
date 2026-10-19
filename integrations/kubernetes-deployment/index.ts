@@ -264,7 +264,7 @@ function buildServer(): McpServer {
     {
       title: "Search Thoughts",
       description:
-        "Search captured thoughts by meaning. Use this when the user asks about a topic, person, or idea they've previously captured.",
+        "Search captured thoughts by meaning. Use this when the user asks about a topic, person, or idea they've previously captured. After searching thoughts, also read the subject's wiki page (wiki_search / wiki_read) before answering or acting: the wiki is the compiled, checked view, thoughts are the raw source.",
       annotations: {
         readOnlyHint: true,
       },

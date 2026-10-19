@@ -186,7 +186,9 @@ MCP tools on the same endpoint and key:
 | `wiki_search` | Full-text (Postgres `simple` config, works for any language) plus embedding similarity, merged by reciprocal rank fusion |
 | `wiki_write` | Create or update a page; every write stores a revision. `expected_revision` prevents lost updates, `append=true` adds to the end |
 
-The server also sends MCP `instructions` telling clients when to use the wiki and when to use raw thoughts.
+The server also sends MCP `instructions` telling clients when to use the wiki and when to use raw thoughts: after `search_thoughts`, also read the subject's wiki page before answering or acting.
+
+Pages tagged `merged` (pointers left after merging two pages) are hidden from `wiki_index`, `wiki_list` (unless the tag filter is `merged`), `wiki_search` and the sub-page and backlink lines of `wiki_read`; `wiki_read` on their slug still shows the pointer.
 
 ### Compile job
 

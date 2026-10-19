@@ -13,6 +13,7 @@ import {
   getPage,
   LINK_PATTERN,
   listPages,
+  MERGED_TAG,
   normalizeTags,
   oneLine,
   renderLog,
@@ -43,8 +44,6 @@ const CHUNK_CHARS = 160_000;
 const DUPLICATE_SIMILARITY = 0.9;
 // An update may drop fewer than max(this, a quarter of the page's cited thoughts) citations.
 const DROP_LIMIT = 4;
-// Pointer pages left by a merge carry this tag: they take no new thoughts and are not linked, rebuilt or linted.
-const MERGED_TAG = "merged";
 // Exit status when a page failed: the systemd unit then fails, which the sites-1 watchdog reports.
 const FAILED_PAGES_EXIT = 3;
 const RELATED_LIMIT = 20;

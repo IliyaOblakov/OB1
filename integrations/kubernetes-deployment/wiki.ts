@@ -94,6 +94,9 @@ const CATEGORY_HEADINGS: Record<string, string> = {
 };
 
 export const VIRTUAL_PAGES = ["index", "log", "pending"];
+// Pointer pages left by a merge carry this tag: hidden from index, list and search (still readable by slug);
+// the compiler gives them no new thoughts and does not link, rebuild or lint them.
+export const MERGED_TAG = "merged";
 
 const SLUG_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 export const LINK_PATTERN = /\[\[([^\]|\n]+)(?:\|([^\]\n]*))?\]\]/g;
@@ -107,7 +110,7 @@ const SEMANTIC_FLOOR = 0.25;
 export const WIKI_INSTRUCTIONS = [
   "Open Brain has two layers. Thoughts (capture_thought, search_thoughts, list_thoughts) are the append-only raw notes and the source of truth.",
   "The wiki (wiki_index, wiki_search, wiki_read) is compiled from thoughts into one page per project, client, person, system or rule set, current state first, with [#id] citations.",
-  "For background on a subject, read the wiki first, then search_thoughts for anything newer than the page's updated date.",
+  "After search_thoughts, also read the subject's wiki page (wiki_search / wiki_read) before answering or acting: the wiki is the compiled, checked view, thoughts are the raw source and hold anything newer than the page's updated date.",
   "Record new facts with capture_thought; use wiki_write only to correct or restructure a page.",
 ].join(" ");
 
@@ -307,10 +310,14 @@ export async function getPage(client: PoolClient, slug: string): Promise<WikiPag
 
 export async function listPages(
   client: PoolClient,
-  opts: { tag?: string; days?: number; sort?: "slug" | "updated"; limit?: number; offset?: number } = {},
+  opts: { tag?: string; days?: number; sort?: "slug" | "updated"; limit?: number; offset?: number; hideMerged?: boolean } = {},
 ): Promise<PageListing[]> {
   const where: string[] = [];
   const params: unknown[] = [];
+  if (opts.hideMerged) {
+    params.push(MERGED_TAG);
+    where.push(`NOT (tags @> ARRAY[$${params.length}::text])`);
+  }
   if (opts.tag) {
     params.push(opts.tag.trim().toLowerCase());
     where.push(`tags @> ARRAY[$${params.length}::text]`);
@@ -334,8 +341,8 @@ export async function listPages(
 
 export async function backlinks(client: PoolClient, slug: string): Promise<string[]> {
   const result = await client.queryObject<{ slug: string }>(
-    "SELECT slug FROM wiki_pages WHERE links @> ARRAY[$1::text] AND slug <> $1 ORDER BY slug",
-    [slug],
+    "SELECT slug FROM wiki_pages WHERE links @> ARRAY[$1::text] AND slug <> $1 AND NOT (tags @> ARRAY[$2::text]) ORDER BY slug",
+    [slug, MERGED_TAG],
   );
   return result.rows.map((r) => r.slug);
 }
@@ -343,8 +350,9 @@ export async function backlinks(client: PoolClient, slug: string): Promise<strin
 // Sub-pages extend their parent's slug ("hotel-sofia-payments" under "hotel-sofia").
 export async function pageFamily(client: PoolClient, slug: string): Promise<{ parent: string | null; children: string[] }> {
   const result = await client.queryObject<{ slug: string }>(
-    "SELECT slug FROM wiki_pages WHERE (slug LIKE $1 || '-%' OR $1 LIKE slug || '-%') AND slug <> $1 ORDER BY slug",
-    [slug],
+    `SELECT slug FROM wiki_pages WHERE (slug LIKE $1 || '-%' OR $1 LIKE slug || '-%') AND slug <> $1
+       AND NOT (tags @> ARRAY[$2::text]) ORDER BY slug`,
+    [slug, MERGED_TAG],
   );
   const related = result.rows.map((r) => r.slug);
   const ancestors = related.filter((s) => slug.startsWith(`${s}-`)).sort((a, b) => b.length - a.length);
@@ -618,22 +626,23 @@ export async function searchPages(
       `SELECT slug,
               ts_headline('simple', body, q, 'MaxFragments=2, MinWords=6, MaxWords=24, FragmentDelimiter=" ... ", StartSel=**, StopSel=**') AS snippet
        FROM wiki_pages, websearch_to_tsquery('simple', $1) AS q
-       WHERE search_tsv @@ q
+       WHERE search_tsv @@ q AND NOT (tags @> ARRAY[$3::text])
        ORDER BY ts_rank_cd(search_tsv, q) DESC, slug
        LIMIT $2`,
-      [q, depth],
+      [q, depth, MERGED_TAG],
     );
     const names = await client.queryObject<{ slug: string }>(
-      `SELECT slug FROM wiki_pages WHERE slug ILIKE $1 OR title ILIKE $1 ORDER BY length(slug), slug LIMIT $2`,
-      [likePattern(q), depth],
+      `SELECT slug FROM wiki_pages WHERE (slug ILIKE $1 OR title ILIKE $1) AND NOT (tags @> ARRAY[$3::text])
+       ORDER BY length(slug), slug LIMIT $2`,
+      [likePattern(q), depth, MERGED_TAG],
     );
     let meaning: string[] = [];
     if (vector) {
       const semantic = await client.queryObject<{ slug: string; similarity: number }>(
         `SELECT slug, 1 - (embedding <=> $1::vector) AS similarity
-         FROM wiki_pages WHERE embedding IS NOT NULL
+         FROM wiki_pages WHERE embedding IS NOT NULL AND NOT (tags @> ARRAY[$3::text])
          ORDER BY embedding <=> $1::vector LIMIT $2`,
-        [vector, depth],
+        [vector, depth, MERGED_TAG],
       );
       meaning = semantic.rows.filter((r) => Number(r.similarity) >= SEMANTIC_FLOOR).map((r) => r.slug);
     }
@@ -773,7 +782,7 @@ export async function renderPending(client: PoolClient, limit = 50): Promise<str
 }
 
 export async function buildIndex(client: PoolClient): Promise<string> {
-  return renderIndex(await listPages(client), await compileStatus(client));
+  return renderIndex(await listPages(client, { hideMerged: true }), await compileStatus(client));
 }
 
 function formatIds(ids: number[], max = 120): string {
@@ -887,7 +896,7 @@ export function registerWikiTools(server: McpServer, ctx: WikiContext): void {
     {
       title: "List Wiki Pages",
       description:
-        "List wiki pages with their one-line summaries, optionally filtered by tag or category (project, client, person, organization, infrastructure, tool, process, rules, topic) or by pages updated in the last N days. Use it to find a slug for wiki_read; wiki_index gives the grouped overview.",
+        "List wiki pages with their one-line summaries, optionally filtered by tag or category (project, client, person, organization, infrastructure, tool, process, rules, topic) or by pages updated in the last N days. Use it to find a slug for wiki_read; wiki_index gives the grouped overview. Merged pointer pages are hidden unless tag is 'merged'.",
       annotations: { readOnlyHint: true },
       inputSchema: {
         tag: z.string().optional().describe("Only pages with this tag or category"),
@@ -904,6 +913,7 @@ export function registerWikiTools(server: McpServer, ctx: WikiContext): void {
             tag,
             days,
             sort,
+            hideMerged: tag?.trim().toLowerCase() !== MERGED_TAG,
             limit: Math.min(Math.max(1, Math.floor(limit)), 1000),
             offset: Math.max(0, Math.floor(offset)),
           });
