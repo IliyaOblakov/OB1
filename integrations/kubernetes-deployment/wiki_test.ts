@@ -567,6 +567,8 @@ Deno.test({
           assertStringIncludes(refused, "hotel-sofia: update dropped");
           assertMatch(refused, /FAILED hotel-sofia: the update dropped \d+ cited thoughts twice; page left unchanged/);
           assertStringIncludes(refused, "partial");
+          assertStringIncludes(refused, "by hand with wiki_write");
+          assert(!refused.includes("Lint failed"), refused);
         } finally {
           fake.dropOld = false;
         }
@@ -578,6 +580,7 @@ Deno.test({
 
         const recovered = await compile();
         assertStringIncludes(recovered, "updated hotel-sofia");
+        assert(!recovered.includes("Lint failed"), recovered);
         assert(!recovered.includes("[[old-hotel-notes]]"), "lint ignores merged pages");
         assertStringIncludes(await ok("wiki_read", { slug: "hotel-sofia" }), "Fact from thought 1 [#1]");
       });

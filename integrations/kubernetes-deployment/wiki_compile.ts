@@ -530,7 +530,11 @@ async function draftUpdate(
     // A routine update must not quietly drop facts a checked page already cites: retry once, then leave the page alone.
     const lost = droppedCitations(page.body, draft.body);
     if (lost.length < Math.max(DROP_LIMIT, Math.ceil(extractCitations(page.body).length / 4))) return draft;
-    if (attempt === 2) throw new Error(`the update dropped ${lost.length} cited thoughts twice; page left unchanged`);
+    if (attempt === 2) {
+      throw new Error(
+        `the update dropped ${lost.length} cited thoughts twice; page left unchanged. Fold its pending thoughts in by hand with wiki_write (COMPILE_PROMPT.md step 3); once the page cites them, the next run moves on`,
+      );
+    }
     log(`${slug}: update dropped ${lost.length} cited thoughts; asking again`);
     prompt += `\n\nYour previous answer removed the facts cited as ${lost.map((id) => `[#${id}]`).join("")}. Return the complete page again and keep those facts unless a thought above supersedes or retracts them.`;
   }
